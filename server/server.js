@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import dotenv from "dotenv";
 import http from "http";
@@ -6,13 +7,20 @@ import mongoose from "mongoose";
 import { connectDB } from "./db/connectToDB.js";
 import Ticket from "./models/Ticket.js";
 import ChatMessage from "./models/ChatMessage.js";
+import metricsRouter from "./metrics.js";
 
 dotenv.config();
-// console.log("OPEN_API_KEY:", process.env.OPEN_API_KEY);
 
 const app = express();
 app.use(express.json());
 app.use(express.static("public")); // serves /public/*.html
+app.use("/api", metricsRouter);
+
+// Simple request logger (helps debug 404s / route mismatches)
+app.use((req, _res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+  next();
+});
 
 // --- HTTP + WebSocket setup ---
 const server = http.createServer(app);
@@ -240,6 +248,47 @@ app.post("/api/tickets/:id/chat", async (req, res) => {
   }
 });
 
+// --- REST: close ticket (NEW) ---
+app.patch("/api/tickets/:id/close", async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log("Close attempt:", { id, len: id?.length });
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res
+        .status(404)
+        .json({ success: false, message: "not found", reason: "bad_id" });
+    }
+
+    const ticket = await Ticket.findById(id);
+    if (!ticket) {
+      return res
+        .status(404)
+        .json({ success: false, message: "not found", reason: "missing" });
+    }
+
+    if (ticket.status === "fixed") {
+      io.emit("ticket:closed", { _id: ticket._id, title: ticket.title });
+      await computeAndEmitStats();
+      return res
+        .status(409)
+        .json({ success: true, already: true, _id: ticket._id });
+    }
+
+    ticket.status = "fixed";
+    ticket.closedAt = new Date();
+    await ticket.save();
+
+    io.emit("ticket:closed", { _id: ticket._id, title: ticket.title });
+    await computeAndEmitStats();
+
+    return res.json({ success: true, _id: ticket._id });
+  } catch (err) {
+    console.error("Close ticket error:", err);
+    return res.status(500).json({ success: false, message: "server_error" });
+  }
+});
+
 // --- REST: list tickets ---
 app.get("/api/tickets", async (_req, res) => {
   try {
@@ -250,7 +299,7 @@ app.get("/api/tickets", async (_req, res) => {
   }
 });
 
-app.get("/", (req, res) => {
+app.get("/", (_req, res) => {
   res.send("Server is running ✅");
 });
 
@@ -284,7 +333,13 @@ io.on("connection", async (socket) => {
 const PORT = process.env.PORT || 4000;
 try {
   await connectDB();
-  console.log("✅ Mongo connected");
+  mongoose.connection.on("connected", () => {
+    console.log(
+      "✅ Mongo connected:",
+      mongoose.connection.host,
+      mongoose.connection.name
+    );
+  });
   server.listen(PORT, () => {
     console.log(`🚀 Running on PORT ${PORT}`);
     setInterval(async () => {
