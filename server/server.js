@@ -148,6 +148,8 @@ app.post("/api/tickets", async (req, res) => {
       messageCount: 0,
     });
 
+    activateAgentTickets.delete(String(ticket._id));
+
     // Persist a bot welcome message so it shows for both user & staff
     const welcomeText =
       "🤖 Chatbot will triage your issue and a specialist will join shortly.";

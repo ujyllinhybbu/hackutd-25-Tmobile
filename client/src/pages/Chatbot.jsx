@@ -301,6 +301,7 @@ export default function Chatbot() {
           severity,
         }),
       });
+
       const data = await res.json();
       if (!data?.success) {
         setError(data?.error || "Failed to create ticket.");
@@ -308,6 +309,7 @@ export default function Chatbot() {
       }
 
       setTicketAndPersist(data.ticket._id);
+      setMessages([]);
       setStatusText(`Status: ${data.ticket.status || "open"}`);
 
       // ensure socket is up and joining
