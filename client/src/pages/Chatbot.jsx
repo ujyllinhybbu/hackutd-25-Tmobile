@@ -1,162 +1,316 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { io } from "socket.io-client";
 import {
   Send,
-  Mic,
-  Paperclip,
-  Trash2,
-  Sparkles,
-  Bot,
-  User,
   ChevronLeft,
+  User,
+  MapPin,
+  ClipboardList,
+  FileText,
   Loader2,
+  AlertCircle,
 } from "lucide-react";
 
 /** --- THEME (T-Mobile) --- */
-const TMOBILE = {
+const T = {
   magenta: "#E20074",
   magentaLight: "#FF77C8",
-  magentaSoft: "#FF9AD5",
   surface: "rgba(255,255,255,0.72)",
+  surface2: "rgba(255,255,255,0.88)",
   stroke: "rgba(255,255,255,0.35)",
-  grid: "rgba(0,0,0,0.08)",
   ink: "#0f172a",
 };
 
-const SUGGESTED = [
-  "Why is my bill higher this month?",
-  "My data is slow in Dallas. Any outages?",
-  "Help me troubleshoot a device issue.",
-  "Change my plan and add a new line.",
-];
-
-const STORAGE_KEY = "tmobile_chat_messages_v1";
-
-/** Message bubble component */
-function Bubble({ role, text, ts }) {
-  const isUser = role === "user";
-  return (
-    <div
-      className={`max-w-[85%] sm:max-w-[70%] md:max-w-[60%] rounded-2xl p-3 sm:p-4 shadow-sm border
-        ${isUser ? "ml-auto" : "mr-auto"}`}
-      style={{
-        background: isUser ? TMOBILE.magenta : "rgba(255,255,255,0.9)",
-        color: isUser ? "#fff" : TMOBILE.ink,
-        borderColor: isUser ? "transparent" : TMOBILE.stroke,
-      }}
-      aria-live="polite"
-    >
-      <div className="flex items-center gap-2 mb-1">
-        {isUser ? (
-          <User className="h-4 w-4 opacity-90" />
-        ) : (
-          <Bot className="h-4 w-4" color={TMOBILE.magenta} />
-        )}
-        <span className="text-xs opacity-70">
-          {new Date(ts).toLocaleTimeString([], {
-            hour: "2-digit",
-            minute: "2-digit",
-          })}
-        </span>
-      </div>
-      <p className="text-sm sm:text-base leading-relaxed whitespace-pre-wrap">
-        {text}
-      </p>
-    </div>
-  );
-}
-
-/** Typing indicator */
-function TypingDots() {
-  return (
-    <div
-      className="inline-flex items-center gap-2 rounded-full px-3 py-2 text-sm border"
-      style={{
-        background: "rgba(255,255,255,0.95)",
-        borderColor: TMOBILE.stroke,
-        color: TMOBILE.ink,
-      }}
-      aria-live="polite"
-    >
-      <Loader2 className="h-4 w-4 animate-spin" color={TMOBILE.magenta} />
-      Agent is typing…
-    </div>
-  );
-}
+const STORAGE_KEYS = {
+  ticketId: "tm_ticket_id",
+  requesterName: "tm_requester_name",
+};
 
 export default function Chatbot() {
-  const [messages, setMessages] = useState(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      return raw ? JSON.parse(raw) : [];
-    } catch {
-      return [];
-    }
+  /* ---------------- State ---------------- */
+  const [name, setName] = useState(
+    () => localStorage.getItem(STORAGE_KEYS.requesterName) || ""
+  );
+  const [city, setCity] = useState("");
+  const [severity, setSeverity] = useState("minor");
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+
+  const [ticketId, setTicketId] = useState(() => {
+    const qs = new URLSearchParams(location.search).get("id");
+    return qs || localStorage.getItem(STORAGE_KEYS.ticketId) || "";
   });
+  const [statusText, setStatusText] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+
   const [input, setInput] = useState("");
-  const [isTyping, setIsTyping] = useState(false);
-  const scrollRef = useRef(null);
+  const [messages, setMessages] = useState([]); // [{authorType, authorName, text, createdAt}]
+  const [loadingHistory, setLoadingHistory] = useState(false);
+
   const listRef = useRef(null);
+  const socketRef = useRef(null);
+  const joinRetryTimerRef = useRef(null);
+  const joinedRoomRef = useRef(null);
 
-  /** Persist to localStorage */
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
-  }, [messages]);
+  // self-send buffer to ignore echoed 'chat:new'
+  const selfBufferRef = useRef([]);
+  const pruneSelf = () => {
+    const now = Date.now();
+    selfBufferRef.current = selfBufferRef.current.filter(
+      (s) => now - s.at <= 2000
+    );
+  };
 
-  /** Auto-scroll to bottom on new message */
-  useEffect(() => {
+  /* ---------------- Helpers ---------------- */
+  const setTicketAndPersist = (id) => {
+    const tid = String(id);
+    setTicketId(tid);
+    localStorage.setItem(STORAGE_KEYS.ticketId, tid);
+
+    const u = new URL(location.href);
+    u.searchParams.set("id", tid);
+    history.replaceState({}, "", u);
+  };
+
+  const scrollToBottom = () => {
     const el = listRef.current;
     if (!el) return;
-    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-  }, [messages, isTyping]);
+    el.scrollTop = el.scrollHeight;
+  };
 
-  /** Placeholder: simulate a bot response after sending */
-  async function fakeBotResponse(userText) {
-    setIsTyping(true);
-    // TODO: Replace with your real call, e.g.:
-    // const res = await axios.post("/api/chat", { text: userText });
-    // const botText = res.data.text;
-    const canned = [
-      "Thanks for the details! Let me check your account & relevant diagnostics.",
-      "I can help with that. A quick reset often helps—shall I walk you through it?",
-      "I’m reviewing your area’s network status and line provisioning now.",
-      "I can escalate this to a specialist team and follow up via SMS or email.",
-    ];
-    const botText = canned[Math.floor(Math.random() * canned.length)];
+  const addMsg = (m) => {
+    setMessages((prev) => [...prev, m]);
+  };
 
-    await new Promise((r) => setTimeout(r, 900 + Math.random() * 800));
-    setMessages((prev) => [
-      ...prev,
-      { id: crypto.randomUUID(), role: "bot", text: botText, ts: Date.now() },
-    ]);
-    setIsTyping(false);
-  }
-
-  /** Send a message */
-  const sendMessage = async () => {
-    const text = input.trim();
-    if (!text) return;
-    setMessages((prev) => [
-      ...prev,
-      { id: crypto.randomUUID(), role: "user", text, ts: Date.now() },
-    ]);
-    setInput("");
+  const loadHistory = async (tid) => {
+    if (!tid) return;
+    setLoadingHistory(true);
     try {
-      await fakeBotResponse(text);
+      // Prefer /chat; fallback to /messages
+      let res = await fetch(`/api/tickets/${tid}/chat`);
+      if (!res.ok) {
+        res = await fetch(`/api/tickets/${tid}/messages`);
+      }
+      const data = await res.json().catch(() => null);
+      // Supported shapes:
+      // { success: true, messages: [...] }  OR  [...]
+      const msgs = Array.isArray(data) ? data : data?.messages || [];
+      setMessages(msgs);
     } catch (e) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: crypto.randomUUID(),
-          role: "bot",
-          text: "Sorry, I couldn’t reach the server. Please try again.",
-          ts: Date.now(),
-        },
-      ]);
-      setIsTyping(false);
+      console.error("History load failed:", e);
+    } finally {
+      setLoadingHistory(false);
+      setTimeout(scrollToBottom, 50);
     }
   };
 
-  /** Keyboard: Enter to send, Shift+Enter for newline */
+  /* ---------------- Socket wiring ---------------- */
+  const startJoinRetry = () => {
+    stopJoinRetry();
+    joinOnce();
+    joinRetryTimerRef.current = setInterval(joinOnce, 2000);
+  };
+  const stopJoinRetry = () => {
+    if (joinRetryTimerRef.current) {
+      clearInterval(joinRetryTimerRef.current);
+      joinRetryTimerRef.current = null;
+    }
+  };
+  const joinOnce = () => {
+    if (!socketRef.current || !ticketId) return;
+    socketRef.current.emit("join", { role: "user", ticketId });
+  };
+
+  useEffect(() => {
+    // create socket (same origin)
+    if (socketRef.current) return;
+    const socket = io({
+      autoConnect: true,
+      transports: ["websocket", "polling"],
+    });
+    socketRef.current = socket;
+
+    socket.on("connect", () => {
+      if (ticketId) {
+        startJoinRetry();
+        loadHistory(ticketId);
+      }
+    });
+
+    socket.io.on("reconnect", () => {
+      joinedRoomRef.current = null;
+      if (ticketId) {
+        startJoinRetry();
+        loadHistory(ticketId);
+      }
+    });
+
+    socket.on("joined", (d) => {
+      joinedRoomRef.current = d.room;
+      if (d.room === `ticket:${ticketId}`) stopJoinRetry();
+    });
+
+    socket.on("chat:new", (m) => {
+      if (String(m.ticketId) !== String(ticketId)) return;
+      if (m.authorType === "user") {
+        pruneSelf();
+        const i = selfBufferRef.current.findIndex(
+          (s) =>
+            s.authorName === m.authorName &&
+            s.text === m.text &&
+            Math.abs(new Date(m.createdAt).getTime() - s.at) < 2000
+        );
+        if (i !== -1) {
+          selfBufferRef.current.splice(i, 1);
+          return;
+        }
+      }
+      addMsg(m);
+      setTimeout(scrollToBottom, 10);
+    });
+
+    socket.on("ticket:updated", (p) => {
+      if (p?.id && String(p.id) === String(ticketId) && p.status) {
+        setStatusText(`Status: ${p.status}`);
+      }
+    });
+
+    socket.on("ticket:closed", (t) => {
+      if (t?._id && String(t._id) === String(ticketId)) {
+        setStatusText("Status: fixed");
+      }
+    });
+
+    socket.on("connect_error", (err) =>
+      console.warn("socket connect_error", err)
+    );
+    socket.on("error", (err) => console.warn("socket error", err));
+
+    return () => {
+      stopJoinRetry();
+      try {
+        socket.disconnect();
+      } catch {}
+      socketRef.current = null;
+    };
+  }, [ticketId]);
+
+  /* ---------------- Effects ---------------- */
+  useEffect(() => {
+    // autoscroll on new messages
+    scrollToBottom();
+  }, [messages.length, loadingHistory]);
+
+  /* ---------------- Actions ---------------- */
+  const startChat = async () => {
+    setError("");
+    const requesterName = name.trim() || "Guest";
+    const c = city.trim() || "Unknown";
+    const t = title.trim() || "Issue";
+    const d = description.trim() || "";
+
+    if (!t || !d) {
+      setError("Please provide an issue title and short description.");
+      return;
+    }
+
+    try {
+      setSubmitting(true);
+      const res = await fetch("/api/tickets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          requesterName,
+          city: c,
+          title: t,
+          description: d,
+          severity,
+        }),
+      });
+      const data = await res.json();
+      if (!data?.success) {
+        setError(data?.error || "Failed to create ticket.");
+        return;
+      }
+      localStorage.setItem(STORAGE_KEYS.requesterName, requesterName);
+
+      setTicketAndPersist(data.ticket._id);
+      setStatusText(`Status: ${data.ticket.status || "open"}`);
+
+      // ensure socket is up and joining
+      if (socketRef.current?.connected) {
+        startJoinRetry();
+      }
+
+      // history includes the welcome bot message
+      await loadHistory(data.ticket._id);
+    } catch (e) {
+      console.error(e);
+      setError("Network error creating ticket.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const sendMessage = async () => {
+    const text = input.trim();
+    if (!text) return;
+    if (!ticketId) {
+      addMsg({
+        authorType: "bot",
+        authorName: "AutoBot",
+        text: "No ticket active. Click Start Chat.",
+        createdAt: new Date().toISOString(),
+      });
+      setInput("");
+      return;
+    }
+    const authorName = name.trim() || "You";
+    setInput("");
+
+    // optimistic render
+    const now = Date.now();
+    addMsg({
+      authorType: "user",
+      authorName,
+      text,
+      createdAt: new Date(now).toISOString(),
+    });
+    selfBufferRef.current.push({ text, authorName, at: now });
+    pruneSelf();
+
+    try {
+      const res = await fetch(`/api/tickets/${ticketId}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          authorType: "user",
+          authorName: name.trim() || "Guest",
+          text,
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        addMsg({
+          authorType: "bot",
+          authorName: "AutoBot",
+          text: `⚠️ Failed to send (${res.status}): ${
+            body?.message || body?.error || "unknown error"
+          }`,
+          createdAt: new Date().toISOString(),
+        });
+      }
+    } catch (e) {
+      addMsg({
+        authorType: "bot",
+        authorName: "AutoBot",
+        text: "⚠️ Network error while sending. Please try again.",
+        createdAt: new Date().toISOString(),
+      });
+    }
+  };
+
   const onKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -164,20 +318,30 @@ export default function Chatbot() {
     }
   };
 
-  /** Clear conversation */
-  const clearAll = () => {
-    if (confirm("Clear this conversation?")) {
-      setMessages([]);
-      localStorage.removeItem(STORAGE_KEY);
-    }
-  };
+  /* ---------------- UI ---------------- */
+  const TicketPill = () =>
+    ticketId ? (
+      <span
+        className="pill inline-block px-3 py-1 rounded-full text-xs border"
+        style={{ background: T.surface2, borderColor: T.stroke, color: T.ink }}
+      >
+        Ticket: <b className="ml-1">{ticketId}</b>
+      </span>
+    ) : null;
 
-  /** Empty state */
-  const isEmpty = messages.length === 0 && !isTyping;
+  const StatusPill = () =>
+    statusText ? (
+      <span
+        className="pill inline-block px-3 py-1 rounded-full text-xs border"
+        style={{ background: T.surface2, borderColor: T.stroke, color: T.ink }}
+      >
+        {statusText}
+      </span>
+    ) : null;
 
   return (
     <div
-      className="min-h-screen flex flex-col"
+      className="min-h-screen"
       style={{
         background:
           "radial-gradient(1200px 700px at -10% -10%, rgba(226,0,116,0.08), transparent 50%), radial-gradient(1200px 700px at 110% 10%, rgba(255,119,200,0.08), transparent 50%), linear-gradient(to bottom right, #ffffff, #f8fafc)",
@@ -186,16 +350,13 @@ export default function Chatbot() {
       {/* Header */}
       <header
         className="sticky top-0 z-10 border-b backdrop-blur-xl"
-        style={{
-          background: "rgba(255,255,255,0.75)",
-          borderColor: TMOBILE.stroke,
-        }}
+        style={{ background: "rgba(255,255,255,0.75)", borderColor: T.stroke }}
       >
         <div className="mx-auto max-w-4xl px-4 sm:px-6 md:px-8 py-3 flex items-center justify-between">
           <a
             href="/"
             className="inline-flex items-center gap-2 text-sm font-medium"
-            style={{ color: TMOBILE.magenta }}
+            style={{ color: T.magenta }}
           >
             <ChevronLeft className="h-4 w-4" />
             Dashboard
@@ -203,181 +364,254 @@ export default function Chatbot() {
           <div className="text-center">
             <div
               className="inline-flex items-center gap-2 px-2.5 py-1 rounded-full text-xs font-semibold"
-              style={{
-                background: "rgba(226,0,116,0.12)",
-                color: TMOBILE.magenta,
-              }}
+              style={{ background: "rgba(226,0,116,0.12)", color: T.magenta }}
             >
-              <span
-                className="inline-block w-1.5 h-1.5 rounded-full"
-                style={{ background: TMOBILE.magenta }}
-              />
-              Live Chat
+              📲 Customer Support Chat
             </div>
             <h1
               className="mt-1 text-lg sm:text-xl font-extrabold tracking-tight"
               style={{
-                backgroundImage: `linear-gradient(90deg, ${TMOBILE.magenta}, ${TMOBILE.magentaLight})`,
+                backgroundImage: `linear-gradient(90deg, ${T.magenta}, ${T.magentaLight})`,
                 WebkitBackgroundClip: "text",
                 color: "transparent",
               }}
             >
-              T-Mobile Support Assistant
+              Open a Ticket & Chat Live
             </h1>
           </div>
-          <button
-            onClick={clearAll}
-            className="inline-flex items-center gap-2 text-sm px-3 py-2 rounded-xl border transition"
-            style={{ borderColor: TMOBILE.stroke, color: TMOBILE.magenta }}
-            title="Clear chat"
-          >
-            <Trash2 className="h-4 w-4" />
-            Clear
-          </button>
+          <div />
         </div>
       </header>
 
-      {/* Messages */}
-      <main className="mx-auto max-w-4xl w-full px-4 sm:px-6 md:px-8 py-4 flex-1">
-        <div
-          ref={listRef}
-          className="w-full h-full max-h-[calc(100dvh-260px)] sm:max-h-[calc(100dvh-240px)] overflow-y-auto rounded-2xl p-4 sm:p-6 border"
+      {/* Body */}
+      <main className="mx-auto max-w-4xl px-4 sm:px-6 md:px-8 py-4">
+        <section
+          className="rounded-2xl border p-4 sm:p-5"
           style={{
-            background: "rgba(255,255,255,0.65)",
-            borderColor: TMOBILE.stroke,
+            background: T.surface,
+            borderColor: T.stroke,
             boxShadow: "0 8px 26px rgba(226,0,116,0.15)",
           }}
         >
-          {/* Empty / Onboarding */}
-          {isEmpty && (
-            <div className="h-full min-h-[40vh] flex flex-col items-center justify-center text-center">
+          {/* Intake Row */}
+          <div className="flex flex-wrap gap-3 items-end">
+            <div className="flex-1 min-w-[200px]">
+              <label className="text-xs text-slate-600">Your name</label>
               <div
-                className="mb-3 inline-flex items-center justify-center w-12 h-12 rounded-2xl"
-                style={{ background: "rgba(226,0,116,0.12)" }}
+                className="flex items-center gap-2 border rounded-xl px-3 h-11 bg-white/90"
+                style={{ borderColor: T.stroke }}
               >
-                <Sparkles color={TMOBILE.magenta} />
+                <User className="h-4 w-4 text-slate-500" />
+                <input
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="e.g., Erick"
+                  className="flex-1 bg-transparent outline-none text-sm"
+                />
               </div>
-              <h2
-                className="text-xl sm:text-2xl font-bold"
-                style={{ color: TMOBILE.ink }}
-              >
-                How can we help today?
-              </h2>
-              <p className="text-slate-600 mt-1">
-                Try a quick prompt or type your question below.
-              </p>
+            </div>
 
-              <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-2 w-full max-w-2xl">
-                {SUGGESTED.map((s) => (
-                  <button
-                    key={s}
-                    onClick={() => setInput(s)}
-                    className="text-left px-4 py-3 rounded-xl border transition hover:-translate-y-0.5"
-                    style={{
-                      background: "rgba(255,255,255,0.85)",
-                      borderColor: TMOBILE.stroke,
-                      boxShadow: "0 6px 20px rgba(226,0,116,0.12)",
-                    }}
-                  >
-                    <span className="text-sm text-slate-800">{s}</span>
-                  </button>
-                ))}
+            <div className="w-full sm:w-[220px]">
+              <label className="text-xs text-slate-600">City</label>
+              <div
+                className="flex items-center gap-2 border rounded-xl px-3 h-11 bg-white/90"
+                style={{ borderColor: T.stroke }}
+              >
+                <MapPin className="h-4 w-4 text-slate-500" />
+                <input
+                  value={city}
+                  onChange={(e) => setCity(e.target.value)}
+                  placeholder="Dallas"
+                  className="flex-1 bg-transparent outline-none text-sm"
+                />
               </div>
+            </div>
+
+            <div className="w-full sm:w-[220px]">
+              <label className="text-xs text-slate-600">
+                Severity (optional)
+              </label>
+              <div
+                className="flex items-center gap-2 border rounded-xl px-3 h-11 bg-white/90"
+                style={{ borderColor: T.stroke }}
+              >
+                <ClipboardList className="h-4 w-4 text-slate-500" />
+                <select
+                  value={severity}
+                  onChange={(e) => setSeverity(e.target.value)}
+                  className="flex-1 bg-transparent outline-none text-sm"
+                >
+                  <option value="minor">minor</option>
+                  <option value="major">major</option>
+                  <option value="critical">critical</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="w-full sm:w-1/2">
+              <label className="text-xs text-slate-600">Issue title</label>
+              <div
+                className="flex items-center gap-2 border rounded-xl px-3 h-11 bg-white/90"
+                style={{ borderColor: T.stroke }}
+              >
+                <FileText className="h-4 w-4 text-slate-500" />
+                <input
+                  value={title}
+                  onChange={(e) => setTitle(e.target.value)}
+                  placeholder="No signal near downtown"
+                  className="flex-1 bg-transparent outline-none text-sm"
+                />
+              </div>
+            </div>
+
+            <div className="w-full sm:w-1/2">
+              <label className="text-xs text-slate-600">
+                Short description
+              </label>
+              <input
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder="Can't make calls since last night"
+                className="w-full rounded-xl border px-3 h-11 bg-white/90 outline-none text-sm"
+                style={{ borderColor: T.stroke }}
+              />
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                onClick={startChat}
+                disabled={submitting}
+                className="inline-flex items-center gap-2 rounded-xl text-white px-4 py-2 font-medium transition"
+                style={{
+                  background: T.magenta,
+                  boxShadow: "0 8px 22px rgba(226,0,116,0.35)",
+                }}
+              >
+                {submitting ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Starting…
+                  </>
+                ) : (
+                  <>
+                    <Send className="h-4 w-4" />
+                    Start Chat
+                  </>
+                )}
+              </button>
+
+              <TicketPill />
+              <StatusPill />
+            </div>
+          </div>
+
+          {error && (
+            <div
+              className="mt-3 rounded-xl border p-3 text-sm flex items-start gap-2"
+              style={{
+                borderColor: "rgba(239,68,68,0.35)",
+                background: "#fff0f0",
+                color: "#b91c1c",
+              }}
+            >
+              <AlertCircle className="h-4 w-4 mt-0.5" />
+              <span>{error}</span>
             </div>
           )}
 
-          {/* Thread */}
-          <div className="space-y-3">
-            {messages.map((m) => (
-              <Bubble key={m.id} role={m.role} text={m.text} ts={m.ts} />
-            ))}
-
-            {isTyping && (
-              <div className="mt-2">
-                <TypingDots />
-              </div>
-            )}
-          </div>
-        </div>
-      </main>
-
-      {/* Input Bar */}
-      <footer
-        ref={scrollRef}
-        className="sticky bottom-0 border-t backdrop-blur-xl"
-        style={{
-          background: "rgba(255,255,255,0.85)",
-          borderColor: TMOBILE.stroke,
-        }}
-      >
-        <div className="mx-auto max-w-4xl w-full px-4 sm:px-6 md:px-8 py-3">
           <div
-            className="flex items-end gap-2 sm:gap-3 rounded-2xl border p-2 sm:p-3"
-            style={{ background: TMOBILE.surface, borderColor: TMOBILE.stroke }}
-          >
-            <button
-              className="hidden sm:inline-flex items-center justify-center h-10 w-10 rounded-xl border"
-              style={{ borderColor: TMOBILE.stroke }}
-              title="Attach"
-              // TODO: open file picker & send attachment
-              onClick={() => alert("TODO: attachments")}
-            >
-              <Paperclip className="h-5 w-5" />
-            </button>
+            className="my-4 h-px"
+            style={{ background: "rgba(30,41,59,0.35)" }}
+          />
 
-            <textarea
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={onKeyDown}
-              rows={1}
-              placeholder="Type a message…"
-              className="flex-1 resize-none bg-transparent outline-none text-sm sm:text-base max-h-40 leading-6"
-              style={{ color: TMOBILE.ink }}
-            />
-
-            <button
-              className="hidden sm:inline-flex items-center justify-center h-10 px-3 rounded-xl border"
-              style={{ borderColor: TMOBILE.stroke }}
-              title="Voice"
-              // TODO: start/stop microphone capture
-              onClick={() => alert("TODO: voice input")}
-            >
-              <Mic className="h-5 w-5" />
-            </button>
-
-            <button
-              onClick={sendMessage}
-              className="inline-flex items-center gap-2 rounded-xl text-white px-4 py-2 font-medium transition hover:-translate-y-0.5"
+          {/* Chat area */}
+          <div>
+            <div
+              ref={listRef}
+              className="rounded-2xl border p-3 sm:p-4 h-[360px] overflow-y-auto"
               style={{
-                background: TMOBILE.magenta,
-                boxShadow: "0 8px 22px rgba(226,0,116,0.35)",
+                background: "rgba(255,255,255,0.65)",
+                borderColor: T.stroke,
               }}
-              aria-label="Send message"
             >
-              <Send className="h-4 w-4" />
-              <span className="hidden sm:inline">Send</span>
-            </button>
-          </div>
+              {loadingHistory ? (
+                <div className="text-sm text-slate-600">Loading history…</div>
+              ) : messages.length === 0 ? (
+                <div className="text-sm text-slate-600">
+                  {ticketId
+                    ? "Say hello! A specialist will join shortly."
+                    : "Fill the form and click Start Chat to begin."}
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {messages.map((m, idx) => {
+                    const ts = m.createdAt
+                      ? new Date(m.createdAt).toLocaleTimeString([], {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })
+                      : "";
+                    const tone =
+                      m.authorType === "user"
+                        ? { color: "#f472b6" }
+                        : m.authorType === "staff"
+                        ? { color: "#22c55e" }
+                        : { color: "#a78bfa" }; // bot
+                    return (
+                      <div key={idx} className="text-sm">
+                        <div className="font-semibold" style={tone}>
+                          [{m.authorType}] {m.authorName || ""}{" "}
+                          <span className="text-xs text-slate-500">{ts}</span>
+                        </div>
+                        <div className="text-slate-800 whitespace-pre-wrap">
+                          {m.text}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
 
-          {/* Help text */}
-          <div className="mt-2 text-[11px] sm:text-xs text-slate-500">
-            Press{" "}
-            <kbd className="px-1.5 py-0.5 rounded border border-slate-300 bg-white">
-              Enter
-            </kbd>{" "}
-            to send,
-            <span className="mx-1" />{" "}
-            <kbd className="px-1.5 py-0.5 rounded border border-slate-300 bg-white">
-              Shift
-            </kbd>
-            +
-            <kbd className="px-1.5 py-0.5 rounded border border-slate-300 bg-white">
-              Enter
-            </kbd>{" "}
-            for a new line.
+            {/* Composer */}
+            <div
+              className="mt-2 flex items-end gap-2 rounded-2xl border p-2 sm:p-3"
+              style={{ background: T.surface2, borderColor: T.stroke }}
+            >
+              <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={onKeyDown}
+                rows={1}
+                placeholder={
+                  ticketId
+                    ? "Type a message… (Enter to send, Shift+Enter for newline)"
+                    : "Start a chat first"
+                }
+                disabled={!ticketId}
+                className="flex-1 resize-none bg-transparent outline-none text-sm sm:text-base max-h-40 leading-6"
+              />
+              <button
+                onClick={sendMessage}
+                disabled={!ticketId || !input.trim()}
+                className="inline-flex items-center gap-2 rounded-xl text-white px-4 py-2 font-medium transition disabled:opacity-50"
+                style={{
+                  background: T.magenta,
+                  boxShadow: "0 8px 22px rgba(226,0,116,0.35)",
+                }}
+              >
+                <Send className="h-4 w-4" />
+                <span className="hidden sm:inline">Send</span>
+              </button>
+            </div>
+
+            <div className="mt-2 text-[11px] sm:text-xs text-slate-500">
+              Staff subscribed to the <code>support</code> room see your
+              messages in real time.
+            </div>
           </div>
-        </div>
-      </footer>
+        </section>
+      </main>
     </div>
   );
 }
