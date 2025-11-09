@@ -29,12 +29,8 @@ const STORAGE_KEYS = {
   ticketId: "tm_ticket_id",
   requesterName: "tm_requester_name",
   draft: "tm_chat_draft",
-  intake: "tm_intake_draft",
 };
 
-/**
- * Small hooks & helpers
- */
 const useLocal = (key, initial = "") => {
   const [v, setV] = useState(() => localStorage.getItem(key) ?? initial);
   useEffect(() => {
@@ -43,22 +39,6 @@ const useLocal = (key, initial = "") => {
   }, [key, v]);
   return [v, setV];
 };
-
-const useAutoResize = (ref, max = 180) => {
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const handler = () => {
-      el.style.height = "auto";
-      el.style.height = Math.min(el.scrollHeight, max) + "px";
-    };
-    handler();
-    el.addEventListener("input", handler);
-    return () => el.removeEventListener("input", handler);
-  }, [ref, max]);
-};
-
-const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
 
 const timeLabel = (d) =>
   d
@@ -96,7 +76,7 @@ export default function Chatbot() {
   const [error, setError] = useState("");
 
   const [input, setInput] = useLocal(STORAGE_KEYS.draft, "");
-  const [messages, setMessages] = useState([]); // [{authorType, authorName, text, createdAt}]
+  const [messages, setMessages] = useState([]); // [{authorType, authorName, text, createdAt, _id}]
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [connected, setConnected] = useState(false);
   const [unread, setUnread] = useState(0);
@@ -107,8 +87,9 @@ export default function Chatbot() {
   const socketRef = useRef(null);
   const joinRetryTimerRef = useRef(null);
   const atBottomRef = useRef(true);
-  const joinedRoomRef = useRef(null);
 
+  // dedupe
+  const seenIdsRef = useRef(new Set());
   // self-send buffer to ignore echoed 'chat:new'
   const selfBufferRef = useRef([]);
   const pruneSelf = () => {
@@ -117,8 +98,6 @@ export default function Chatbot() {
       (s) => now - s.at <= 2000
     );
   };
-
-  useAutoResize(inputRef);
 
   /* ---------------- Validation ---------------- */
   const titleOk = title.trim().length >= 6;
@@ -140,16 +119,27 @@ export default function Chatbot() {
     bottomRef.current?.scrollIntoView({ behavior: smooth ? "smooth" : "auto" });
   };
 
-  const addMsg = (m) => setMessages((prev) => [...prev, m]);
+  const addMsg = (m) => {
+    const id = m._id || m.id;
+    if (id && seenIdsRef.current.has(String(id))) return;
+    if (id) seenIdsRef.current.add(String(id));
+    setMessages((prev) => [...prev, m]);
+  };
 
   const loadHistory = async (tid) => {
     if (!tid) return;
     setLoadingHistory(true);
     try {
-      let res = await fetch(`/api/tickets/${tid}/chat`);
-      if (!res.ok) res = await fetch(`/api/tickets/${tid}/messages`);
+      let res = await fetch(`/api/tickets/${tid}/messages`);
+      if (!res.ok) {
+        // fallback if you still have this route
+        res = await fetch(`/api/tickets/${tid}/chat`);
+      }
       const data = await res.json().catch(() => null);
       const msgs = Array.isArray(data) ? data : data?.messages || [];
+      const newSeen = new Set();
+      for (const m of msgs) if (m._id) newSeen.add(String(m._id));
+      seenIdsRef.current = newSeen;
       setMessages(msgs);
       setTimeout(() => scrollToBottom(false), 40);
     } catch (e) {
@@ -160,10 +150,14 @@ export default function Chatbot() {
   };
 
   /* ---------------- Socket wiring ---------------- */
+  const joinOnce = () => {
+    if (!socketRef.current || !socketRef.current.connected || !ticketId) return;
+    socketRef.current.emit("join", { role: "customer", ticketId });
+  };
   const startJoinRetry = () => {
     stopJoinRetry();
     joinOnce();
-    joinRetryTimerRef.current = setInterval(joinOnce, 2000);
+    joinRetryTimerRef.current = setInterval(joinOnce, 1200);
   };
   const stopJoinRetry = () => {
     if (joinRetryTimerRef.current) {
@@ -171,17 +165,10 @@ export default function Chatbot() {
       joinRetryTimerRef.current = null;
     }
   };
-  const joinOnce = () => {
-    if (!socketRef.current || !ticketId) return;
-    socketRef.current.emit("join", { role: "user", ticketId });
-  };
 
   useEffect(() => {
     if (socketRef.current) return;
-    const socket = io({
-      autoConnect: true,
-      transports: ["websocket", "polling"],
-    });
+    const socket = io({ autoConnect: true, transports: ["websocket"] });
     socketRef.current = socket;
 
     socket.on("connect", () => {
@@ -196,7 +183,6 @@ export default function Chatbot() {
 
     socket.io.on("reconnect", () => {
       setConnected(true);
-      joinedRoomRef.current = null;
       if (ticketId) {
         startJoinRetry();
         loadHistory(ticketId);
@@ -204,12 +190,28 @@ export default function Chatbot() {
     });
 
     socket.on("joined", (d) => {
-      joinedRoomRef.current = d.room;
-      if (d.room === `ticket:${ticketId}`) stopJoinRetry();
+      if (d?.room === `ticket:${ticketId}`) stopJoinRetry();
+    });
+
+    // ✅ optional backlog event (if server sends it)
+    socket.on("chat:history", (arr) => {
+      if (!Array.isArray(arr)) return;
+      const newSeen = new Set(seenIdsRef.current);
+      const incoming = [];
+      for (const m of arr) {
+        const id = m._id || m.id;
+        if (id && newSeen.has(String(id))) continue;
+        if (id) newSeen.add(String(id));
+        incoming.push(m);
+      }
+      seenIdsRef.current = newSeen;
+      setMessages((prev) => (prev.length === 0 ? arr : [...prev, ...incoming]));
+      setTimeout(() => scrollToBottom(false), 20);
     });
 
     socket.on("chat:new", (m) => {
       if (String(m.ticketId) !== String(ticketId)) return;
+
       if (m.authorType === "user") {
         pruneSelf();
         const i = selfBufferRef.current.findIndex(
@@ -269,7 +271,15 @@ export default function Chatbot() {
 
   /* ---------------- Effects ---------------- */
   useEffect(() => {
-    // focus textarea after starting chat
+    if (ticketId && socketRef.current?.connected) {
+      // join immediately on id change
+      joinOnce();
+      // fetch immediately in case AI wrote before join
+      loadHistory(ticketId);
+    }
+  }, [ticketId]);
+
+  useEffect(() => {
     if (ticketId) inputRef.current?.focus();
   }, [ticketId]);
 
@@ -310,12 +320,20 @@ export default function Chatbot() {
 
       setTicketAndPersist(data.ticket._id);
       setMessages([]);
+      seenIdsRef.current = new Set();
       setStatusText(`Status: ${data.ticket.status || "open"}`);
 
-      // ensure socket is up and joining
-      if (socketRef.current?.connected) startJoinRetry();
-
+      // join and fetch right away
+      if (socketRef.current?.connected) {
+        joinOnce();
+      } else {
+        startJoinRetry();
+      }
       await loadHistory(data.ticket._id);
+
+      // 🔁 safety polls to catch AI reply that lands milliseconds later
+      setTimeout(() => loadHistory(data.ticket._id), 1200);
+      setTimeout(() => loadHistory(data.ticket._id), 3500);
     } catch (e) {
       console.error(e);
       setError("Network error creating ticket.");
@@ -380,13 +398,6 @@ export default function Chatbot() {
         text: "⚠️ Network error while sending. Please try again.",
         createdAt: new Date().toISOString(),
       });
-    }
-  };
-
-  const onKeyDown = (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
     }
   };
 
@@ -466,25 +477,7 @@ export default function Chatbot() {
     </div>
   );
 
-  const intakeHelp = (
-    <div
-      className="grid sm:grid-cols-2 gap-2 text-[11px] text-slate-600"
-      aria-hidden
-    >
-      <div className="rounded-lg border p-2" style={{ borderColor: T.stroke }}>
-        <div className="font-semibold mb-1">Good title</div>
-        <div>"No signal near Deep Ellum since 10pm"</div>
-      </div>
-      <div className="rounded-lg border p-2" style={{ borderColor: T.stroke }}>
-        <div className="font-semibold mb-1">Helpful description</div>
-        <div>
-          "Pixel 8, 75201, tried reboot + airplane mode, still SOS only"
-        </div>
-      </div>
-    </div>
-  );
-
-  const chars = (v) => clamp(v.length, 0, 200);
+  const chars = (v) => Math.min(200, Math.max(0, v.length));
 
   /* ---------------- Render ---------------- */
   return (
@@ -504,7 +497,7 @@ export default function Chatbot() {
             boxShadow: "0 8px 26px rgba(226,0,116,0.15)",
           }}
         >
-          {/* Intake Row */}
+          {/* Intake Row (kept) */}
           <div className="flex flex-wrap gap-3 items-end">
             <div className="flex-1 min-w-[200px]">
               <label htmlFor="name" className="text-xs text-slate-600">
@@ -519,7 +512,7 @@ export default function Chatbot() {
                   id="name"
                   value={name}
                   onChange={(e) => setName(e.target.value)}
-                  placeholder="e.g., Erick"
+                  placeholder="e.g., John"
                   className="flex-1 bg-transparent outline-none text-sm"
                   autoComplete="name"
                 />
@@ -647,13 +640,37 @@ export default function Chatbot() {
                 )}
               </button>
 
-              <TicketPill />
-              <StatusPill />
+              {ticketId && (
+                <Pill>
+                  Ticket: <b className="ml-1">{ticketId}</b>
+                </Pill>
+              )}
+              {statusText && <Pill>{statusText}</Pill>}
             </div>
           </div>
 
           {/* Helper examples */}
-          <div className="mt-2">{intakeHelp}</div>
+          <div
+            className="mt-2 grid sm:grid-cols-2 gap-2 text-[11px] text-slate-600"
+            aria-hidden
+          >
+            <div
+              className="rounded-lg border p-2"
+              style={{ borderColor: T.stroke }}
+            >
+              <div className="font-semibold mb-1">Good title</div>
+              <div>"No signal near Deep Ellum since 10pm"</div>
+            </div>
+            <div
+              className="rounded-lg border p-2"
+              style={{ borderColor: T.stroke }}
+            >
+              <div className="font-semibold mb-1">Helpful description</div>
+              <div>
+                "Pixel 8, 75201, tried reboot + airplane mode, still SOS only"
+              </div>
+            </div>
+          </div>
 
           {error && (
             <div
@@ -682,7 +699,27 @@ export default function Chatbot() {
 
           {/* Chat area */}
           <div>
-            <ConnectionBanner />
+            <div
+              role="status"
+              aria-live="polite"
+              className="sticky top-0 z-20 -mt-4 mb-2 rounded-xl border px-3 py-2 text-xs flex items-center gap-2"
+              style={{
+                background: connected ? "#effdf5" : "#fff5f5",
+                borderColor: connected
+                  ? "rgba(16,185,129,0.35)"
+                  : "rgba(239,68,68,0.35)",
+                color: connected ? "#047857" : "#b91c1c",
+              }}
+            >
+              {connected ? (
+                <Wifi className="h-4 w-4" />
+              ) : (
+                <WifiOff className="h-4 w-4" />
+              )}
+              {connected
+                ? "Connected to support"
+                : "Disconnected — messages will send when reconnected"}
+            </div>
 
             <div
               ref={listRef}
@@ -693,13 +730,40 @@ export default function Chatbot() {
               }}
             >
               <div className="absolute left-0 right-0 flex justify-center pointer-events-none">
-                <NewBadge />
+                {unread > 0 && (
+                  <button
+                    onClick={() => scrollToBottom(true)}
+                    className="group inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium border shadow"
+                    style={{ background: "#fff", borderColor: T.stroke }}
+                  >
+                    <ArrowDown className="h-3.5 w-3.5" /> {unread} new
+                  </button>
+                )}
               </div>
 
               {loadingHistory ? (
                 <div className="text-sm text-slate-600">Loading history…</div>
               ) : messages.length === 0 ? (
-                <EmptyState />
+                <div className="text-sm text-slate-600 flex flex-col items-center justify-center h-full text-center select-none">
+                  <Sparkles className="h-6 w-6 mb-2 opacity-70" />
+                  {ticketId ? (
+                    <>
+                      <p>Say hello! A specialist will join shortly.</p>
+                      <p className="text-[11px] mt-1">
+                        Tip: Include details like device, zip, and steps tried.
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <p>
+                        Fill the form and click <b>Start Chat</b> to begin.
+                      </p>
+                      <p className="text-[11px] mt-1">
+                        We’ll open a ticket and keep everything in one place.
+                      </p>
+                    </>
+                  )}
+                </div>
               ) : (
                 <div className="space-y-3">
                   {groupByDay(messages).map((m, idx) => {
@@ -737,7 +801,7 @@ export default function Chatbot() {
                             heading: "#4338ca",
                           };
                     return (
-                      <div key={idx} className="text-sm">
+                      <div key={m._id || idx} className="text-sm">
                         <div
                           className="rounded-xl border p-2"
                           style={{
@@ -778,7 +842,12 @@ export default function Chatbot() {
                 ref={inputRef}
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
-                onKeyDown={onKeyDown}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    sendMessage();
+                  }
+                }}
                 rows={1}
                 placeholder={
                   ticketId

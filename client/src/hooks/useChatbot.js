@@ -13,6 +13,7 @@ const TICKET_KEY = "tmobile_chat_ticket_id_v1";
  *  - apiBase: REST base path (default "/api")
  *  - socketOrigin: Socket.IO origin ("" for same origin, or e.g. "http://localhost:4000")
  *  - simulate: fallback canned replies (default false)
+ *  - requesterName: display name for the user (default "Guest")
  */
 export default function useChatbot(options = {}) {
   const {
@@ -37,42 +38,65 @@ export default function useChatbot(options = {}) {
 
   const [isTyping, setIsTyping] = useState(false);
   const socketRef = useRef(null);
-  const scrollTrigger = useRef(0); // increment to auto-scroll in UI
+  const scrollTrigger = useRef(0);
 
-  // -------- helpers --------
-  const addMessage = useCallback((role, text, extra = {}) => {
-    const msg = {
-      id: extra.id || crypto.randomUUID(),
-      role, // 'user' | 'staff' | 'bot'
-      author: extra.author || (role === "staff" ? "Agent" : role),
-      text: text || "",
-      ts: extra.ts || Date.now(),
-    };
+  // seen IDs to avoid dupes (history + live)
+  const seenIdsRef = useRef(new Set());
+
+  const persist = (arr) => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(arr));
+    } catch {}
+  };
+
+  const pushMessage = useCallback((msg) => {
+    if (!msg?.id) return;
+    if (seenIdsRef.current.has(msg.id)) return;
+    seenIdsRef.current.add(msg.id);
+
     setMessages((prev) => {
       const next = [...prev, msg];
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-      } catch {}
+      persist(next);
       return next;
     });
+    // if we got a bot message for this thread, stop typing spinner
+    if (msg.role === "bot") setIsTyping(false);
     scrollTrigger.current++;
   }, []);
 
   const replaceAllMessages = useCallback((arr) => {
-    setMessages(arr);
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(arr));
-    } catch {}
+    const ids = new Set();
+    const deduped = [];
+    for (const m of arr) {
+      if (!m?.id || ids.has(m.id)) continue;
+      ids.add(m.id);
+      deduped.push(m);
+    }
+    seenIdsRef.current = ids;
+    setMessages(deduped);
+    persist(deduped);
     scrollTrigger.current++;
   }, []);
 
-  // -------- ensure ticket exists (create once) --------
+  const normalizeWire = (m) => ({
+    id: String(m._id || m.id || crypto.randomUUID()),
+    role:
+      m.authorType === "user"
+        ? "user"
+        : m.authorType === "staff"
+        ? "staff"
+        : "bot",
+    author: m.authorName || m.authorType || "bot",
+    text: m.text || "",
+    ts: new Date(m.createdAt || m.ts || Date.now()).getTime(),
+  });
+
+  // --- create ticket once ---
   useEffect(() => {
     let mounted = true;
     (async () => {
       if (ticketId) return;
       try {
-        // Create a ticket to anchor this chat thread
         const res = await axios.post(`${apiBase}/tickets`, {
           requesterName,
           title: "Customer Chat",
@@ -83,11 +107,11 @@ export default function useChatbot(options = {}) {
         if (id && mounted) {
           setTicketId(id);
           localStorage.setItem(TICKET_KEY, id);
+          // we expect welcome + initial user message + AI soon → show typing
+          setIsTyping(true);
         }
-      } catch (e) {
-        // If server creation fails, we can still simulate locally
+      } catch {
         if (simulate && mounted) {
-          // create a fake id so the UI works offline
           const fake = `local-${crypto.randomUUID()}`;
           setTicketId(fake);
           localStorage.setItem(TICKET_KEY, fake);
@@ -99,7 +123,7 @@ export default function useChatbot(options = {}) {
     };
   }, [apiBase, ticketId, requesterName, simulate]);
 
-  // -------- initial history load --------
+  // --- initial REST history (safety on mount) ---
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -107,21 +131,10 @@ export default function useChatbot(options = {}) {
       try {
         const r = await axios.get(`${apiBase}/tickets/${ticketId}/messages`);
         const arr = Array.isArray(r.data) ? r.data : r.data?.messages || [];
-        const normalized = arr.map((m) => ({
-          id: String(m._id || crypto.randomUUID()),
-          role:
-            m.authorType === "user"
-              ? "user"
-              : m.authorType === "staff"
-              ? "staff"
-              : "bot",
-          author: m.authorName || m.authorType || "bot",
-          text: m.text || "",
-          ts: new Date(m.createdAt || Date.now()).getTime(),
-        }));
+        const normalized = arr.map(normalizeWire);
         if (!cancelled) replaceAllMessages(normalized);
       } catch {
-        // no history endpoint or network — ignore
+        // ignore; socket backlog will cover it on join
       }
     })();
     return () => {
@@ -129,62 +142,104 @@ export default function useChatbot(options = {}) {
     };
   }, [apiBase, ticketId, replaceAllMessages]);
 
-  // -------- socket wiring --------
+  // --- socket wiring (one socket for the page) ---
   useEffect(() => {
-    if (!ticketId || ticketId.startsWith("local-")) return;
-
     const socket = io(socketOrigin || undefined, {
       transports: ["websocket"],
       withCredentials: false,
     });
     socketRef.current = socket;
 
-    socket.on("connect", () => {
+    // helper to (re)join current ticket room
+    const joinCurrent = () => {
+      if (!ticketId || ticketId.startsWith("local-")) return;
       socket.emit("join", { ticketId, role: "customer" });
-    });
+    };
 
-    socket.on("chat:new", (payload) => {
+    socket.on("connect", joinCurrent);
+    // using Manager event is okay, but also cover socket "reconnect" for safety
+    socket.io.on("reconnect", joinCurrent);
+    socket.on("reconnect", joinCurrent);
+
+    // server backlog right after join (server emits this once)
+    const onHistory = (history) => {
+      if (!Array.isArray(history)) return;
+      const normalized = history.map(normalizeWire);
+      replaceAllMessages(normalized);
+    };
+    socket.on("chat:history", onHistory);
+
+    // live messages
+    const onChatNew = (payload) => {
+      if (!payload?.ticketId) return;
       if (String(payload.ticketId) !== String(ticketId)) return;
+      pushMessage(normalizeWire(payload));
+    };
+    socket.on("chat:new", onChatNew);
 
-      const role =
-        payload.authorType === "user"
-          ? "user"
-          : payload.authorType === "staff"
-          ? "staff"
-          : "bot";
-
-      addMessage(role, payload.text || "", {
-        id: String(payload._id || crypto.randomUUID()),
-        ts: new Date(payload.createdAt || Date.now()).getTime(),
-        author: payload.authorName || payload.authorType || role,
-      });
-    });
-
-    // Optional: live typing signal from server
-    socket.on("chat:typing", ({ ticketId: tId, isTyping: typing }) => {
+    // typing (optional)
+    const onTyping = ({ ticketId: tId, isTyping: typing }) => {
       if (String(tId) === String(ticketId)) setIsTyping(Boolean(typing));
-    });
+    };
+    socket.on("chat:typing", onTyping);
+
+    // simple visibility-based re-join in case of sleep/wake
+    const onVis = () => {
+      if (document.visibilityState === "visible") {
+        joinCurrent();
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
 
     return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      socket.off("chat:history", onHistory);
+      socket.off("chat:new", onChatNew);
+      socket.off("chat:typing", onTyping);
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [socketOrigin, ticketId, addMessage]);
+  }, [socketOrigin, ticketId, pushMessage, replaceAllMessages, apiBase]);
 
-  // -------- send message --------
+  // --- CRITICAL: when ticketId changes, join + force-refresh history immediately ---
+  useEffect(() => {
+    if (!ticketId || ticketId.startsWith("local-")) return;
+
+    // if socket already connected, join the room now (don’t wait for reconnect)
+    if (socketRef.current?.connected) {
+      socketRef.current.emit("join", { ticketId, role: "customer" });
+    }
+
+    // eagerly refresh history so we don't miss AI reply that came before join
+    (async () => {
+      try {
+        const r = await axios.get(`${apiBase}/tickets/${ticketId}/messages`);
+        const arr = Array.isArray(r.data) ? r.data : r.data?.messages || [];
+        const normalized = arr.map(normalizeWire);
+        replaceAllMessages(normalized);
+      } catch {
+        // ignore
+      }
+    })();
+  }, [ticketId, apiBase, replaceAllMessages]);
+
+  // --- send message ---
   const sendMessage = useCallback(
     async (text) => {
       if (!text?.trim()) return;
 
-      // Immediate echo of the user's own message
-      addMessage("user", text);
+      if (!ticketId || ticketId.startsWith("local-") || simulate) {
+        // offline demo
+        pushMessage({
+          id: crypto.randomUUID(),
+          role: "user",
+          author: requesterName,
+          text,
+          ts: Date.now(),
+        });
 
-      // show typing until server responds/broadcasts
-      setIsTyping(true);
-
-      try {
-        if (!ticketId || ticketId.startsWith("local-") || simulate) {
-          // Simulated reply (offline)
+        setIsTyping(true);
+        try {
           const canned = [
             "Thanks! A specialist will reply shortly.",
             "I’m checking on that now.",
@@ -192,27 +247,50 @@ export default function useChatbot(options = {}) {
             "Let me escalate this to our support team.",
           ];
           await new Promise((r) => setTimeout(r, 700 + Math.random() * 900));
-          addMessage("bot", canned[Math.floor(Math.random() * canned.length)]);
-        } else {
-          // Real call; server will broadcast 'chat:new' to the room
-          await axios.post(`${apiBase}/tickets/${ticketId}/chat`, {
-            authorType: "user",
-            authorName: requesterName,
-            text,
+          pushMessage({
+            id: crypto.randomUUID(),
+            role: "bot",
+            author: "AutoBot",
+            text: canned[Math.floor(Math.random() * canned.length)],
+            ts: Date.now(),
           });
+        } finally {
+          setIsTyping(false);
         }
-      } catch (e) {
-        addMessage("bot", "⚠️ Network error. Please try again.");
-      } finally {
+        return;
+      }
+
+      // real server: rely on server broadcast for both user echo and AI reply
+      setIsTyping(true);
+
+      // safety timeout: if nothing arrives in 10s, stop spinner
+      const stopTypingIn = setTimeout(() => setIsTyping(false), 10_000);
+
+      try {
+        await axios.post(`${apiBase}/tickets/${ticketId}/chat`, {
+          authorType: "user",
+          authorName: requesterName,
+          text,
+        });
+      } catch {
+        pushMessage({
+          id: crypto.randomUUID(),
+          role: "bot",
+          author: "System",
+          text: "⚠️ Network error. Please try again.",
+          ts: Date.now(),
+        });
         setIsTyping(false);
+      } finally {
+        clearTimeout(stopTypingIn);
       }
     },
-    [addMessage, apiBase, ticketId, requesterName, simulate]
+    [apiBase, ticketId, requesterName, simulate, pushMessage]
   );
 
-  // -------- clear (keep thread id so staff can resume) --------
   const clearChat = useCallback(() => {
     setMessages([]);
+    seenIdsRef.current = new Set();
     try {
       localStorage.removeItem(STORAGE_KEY);
     } catch {}

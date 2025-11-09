@@ -12,38 +12,110 @@ import metricsRouter from "./metrics.js";
 
 dotenv.config();
 
-// OpenAI client (optional - used to generate bot replies). Requires OPENAI_API_KEY in env.
+// --- OpenAI (optional) ---
 const openaiApiKey = process.env.OPENAI_API_KEY || process.env.OPEN_API_KEY;
 if (!openaiApiKey) {
-  console.warn("OpenAI API key not found. AI replies disabled. Set OPENAI_API_KEY in server/.env or environment.");
+  console.warn(
+    "OpenAI API key not found. AI replies disabled. Set OPENAI_API_KEY."
+  );
 }
-
 const openai = openaiApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null;
-console.log(openai ? "OpenAI client initialized" : "OpenAI client not initialized");
+console.log(
+  openai ? "OpenAI client initialized" : "OpenAI client not initialized"
+);
 
+// --- Express ---
 const app = express();
-
-// OpenAI client (optional - used to generate bot replies). Requires OPENAI_API_KEY in env.
-
-
-// ---- Put logger FIRST so all requests are visible
 app.use((req, _res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
   next();
 });
-
 app.use(express.json());
-app.use(express.static("public")); // serves /public/*.html
+app.use(express.static("public"));
 app.use("/api", metricsRouter);
 
-// --- HTTP + WebSocket setup ---
+// --- HTTP + Socket.IO ---
 const server = http.createServer(app);
 const io = new SocketIOServer(server, { cors: { origin: "*" } });
 
-// --- Demo Happiness score (in-memory) ---
-let happiness = 100; // starts at 100
+// --- In-memory ---
+let happiness = 100;
+const activateAgentTickets = new Map(); // ticketId -> last agent activity ms
 
-// --- Helpers ---
+// ---------- AI context helpers ----------
+
+// very rough token estimate (~4 chars per token)
+function estimateTokens(str = "") {
+  return Math.ceil((str || "").length / 4);
+}
+
+/** Fetch recent messages for a ticket (oldest->newest) */
+async function fetchRecentMessages(ticketId, limit = 50) {
+  const msgs = await ChatMessage.find({
+    ticketId: new mongoose.Types.ObjectId(String(ticketId)),
+  })
+    .sort({ createdAt: 1 })
+    .limit(limit);
+
+  return msgs.map((m) => ({
+    id: String(m._id),
+    authorType: m.authorType, // 'user' | 'staff' | 'bot'
+    authorName: m.authorName || m.authorType,
+    text: m.text || "",
+    createdAt: m.createdAt,
+  }));
+}
+
+/**
+ * Build OpenAI chat "messages" with:
+ * - system prompt
+ * - brief ticket context (title/city/keywords/sentiment)
+ * - trimmed conversation history (mapped to user/assistant)
+ */
+function buildMessagesForOpenAI({
+  systemPrompt,
+  ticket,
+  history,
+  modelMaxTokens = 12000,
+  responseTokens = 500,
+}) {
+  const headroom = modelMaxTokens - responseTokens;
+
+  const messages = [{ role: "system", content: systemPrompt.trim() }];
+
+  const ctxParts = [];
+  if (ticket?.title) ctxParts.push(`Issue: ${ticket.title}`);
+  if (ticket?.city) ctxParts.push(`City: ${ticket.city}`);
+  if (Array.isArray(ticket?.keywords) && ticket.keywords.length)
+    ctxParts.push(`Keywords: ${ticket.keywords.join(", ")}`);
+  if (ticket?.sentiment) ctxParts.push(`Prev sentiment: ${ticket.sentiment}`);
+  const contextBlock = ctxParts.length
+    ? `Ticket context — ${ctxParts.join(" · ")}`
+    : "Ticket context — (none)";
+  messages.push({ role: "system", content: contextBlock });
+
+  const mapRole = (t) => (t === "user" ? "user" : "assistant");
+  const convo = [];
+  let used = estimateTokens(systemPrompt) + estimateTokens(contextBlock);
+
+  for (let i = history.length - 1; i >= 0; i--) {
+    const h = history[i];
+    const role = mapRole(h.authorType || "user");
+    const line = `${h.authorName || role}: ${h.text}`;
+    const tk = estimateTokens(line) + 4;
+    if (used + tk > headroom) break;
+    used += tk;
+    convo.unshift({ role, content: line });
+  }
+
+  if (convo.length === 0) {
+    convo.push({ role: "user", content: "User started a new ticket." });
+  }
+
+  return messages.concat(convo);
+}
+
+// ---------- Stats helpers ----------
 async function computeStats() {
   const total = await Ticket.countDocuments();
   const open = await Ticket.countDocuments({ status: { $ne: "fixed" } });
@@ -54,12 +126,14 @@ async function computeStats() {
     { $group: { _id: "$severity", count: { $sum: 1 } } },
   ]);
   const severityCounts = { minor: 0, major: 0, critical: 0 };
-  for (const row of bySeverity) severityCounts[row._id] = row.count || 0;
+  for (const row of bySeverity) {
+    severityCounts[row._id] = row.count || 0;
+  }
 
-  // Avg resolution time (fixed)
   const recentClosed = await Ticket.find({ status: "fixed" })
     .sort({ updatedAt: -1 })
     .limit(200);
+
   let avgResolutionMs = 0;
   if (recentClosed.length) {
     const totalMs = recentClosed.reduce(
@@ -69,7 +143,6 @@ async function computeStats() {
     avgResolutionMs = totalMs / recentClosed.length;
   }
 
-  // Avg active time (open)
   const openTickets = await Ticket.find({ status: { $ne: "fixed" } }).select(
     "createdAt"
   );
@@ -94,7 +167,6 @@ async function computeStats() {
     happiness,
   };
 }
-
 async function computeAndEmitStats() {
   try {
     const payload = await computeStats();
@@ -104,7 +176,191 @@ async function computeAndEmitStats() {
   }
 }
 
-// --- REST: test ticket (kept for curl/Postman) ---
+// ---------- Meta broadcast helpers ----------
+function emitTicketMeta(ticket) {
+  io.emit("ticket:meta", {
+    id: String(ticket._id),
+    messageCount: ticket.messageCount,
+    lastMessageSnippet: ticket.lastMessageSnippet,
+    lastMessageAt: ticket.lastMessageAt,
+    flagged: !!ticket.flagged,
+    flaggedAt: ticket.flaggedAt || null,
+    sentiment: ticket.sentiment || "neutral",
+    keywords: Array.isArray(ticket.keywords) ? ticket.keywords : [],
+  });
+}
+
+async function updateTicketMetaAndEmit(ticket, latestText) {
+  ticket.lastMessageAt = new Date();
+  ticket.lastMessageSnippet = (latestText || "").slice(0, 120);
+  ticket.messageCount = (ticket.messageCount || 0) + 1;
+  await ticket.save();
+  emitTicketMeta(ticket);
+}
+
+// ---------- Centralized message writer ----------
+async function addMessage({
+  ticketId,
+  authorType = "user",
+  authorName = "Guest",
+  text = "",
+  triggerAI = false,
+}) {
+  if (!text.trim()) return null;
+
+  const ticket = await Ticket.findById(ticketId);
+  if (!ticket) throw new Error("Ticket not found");
+
+  const msg = await ChatMessage.create({
+    ticketId: new mongoose.Types.ObjectId(String(ticketId)),
+    authorType,
+    authorName,
+    text,
+  });
+
+  const payload = {
+    _id: msg._id,
+    ticketId: String(msg.ticketId),
+    authorType: msg.authorType,
+    authorName: msg.authorName,
+    text: msg.text,
+    createdAt: msg.createdAt,
+    updatedAt: msg.updatedAt,
+  };
+
+  const room = `ticket:${String(ticketId)}`;
+  io.to(room).emit("chat:new", payload);
+  io.to("support").emit("chat:new", payload);
+
+  await updateTicketMetaAndEmit(ticket, text);
+
+  if (authorType === "agent" || authorType === "staff") {
+    activateAgentTickets.set(String(ticketId), Date.now());
+  }
+
+  // AI trigger (user-only, quiet for 5m after agent message)
+  if (triggerAI && openai && authorType === "user") {
+    const last = activateAgentTickets.get(String(ticketId));
+    const quiet = !last || Date.now() - last >= 5 * 60 * 1000;
+
+    if (quiet) {
+      void (async () => {
+        try {
+          const systemPrompt = `
+You are a T-Mobile customer support assistant.
+
+Respond ONLY in valid JSON with this shape:
+{
+  "reply": "<concise professional answer>",
+  "sentiment": "<neutral|upset|happy|confused>",
+  "flagged": <true|false>,
+  "keywords": ["<keyword1>", "<keyword2>", "..."]
+}
+
+Rules:
+- Only handle T-Mobile topics (accounts, billing, technical support, store info).
+- Extract 1–5 short issue keywords (2–6 words each) from the user's message, e.g. "billing error", "network outage", "SIM issue", "payment declined", "5G not working".
+- Always include the "keywords" array (empty if none).
+- If the user seems angry/frustrated or uses negative language, set "sentiment": "upset".
+- If "sentiment" is "upset", set "flagged": true (requires human follow-up).
+- Also set "flagged": true if the issue needs human review or account access (billing adjustments, refunds, escalations, outages, identity/account verification).
+- Keep "reply" concise, polite, and professional.
+- If asked about non–T-Mobile topics:
+  {
+    "reply": "Sorry, I can only assist with T-Mobile related questions. If I can’t help you directly, a staff member will join soon.",
+    "sentiment": "neutral",
+    "flagged": true,
+    "keywords": ["non-tmobile topic"]
+  }
+`.trim();
+
+          // 1) Pull recent history for THIS ticket (oldest -> newest)
+          const history = await fetchRecentMessages(ticketId, 50);
+
+          // 2) Build messages with system + concise ticket context + trimmed convo
+          const oaMessages = buildMessagesForOpenAI({
+            systemPrompt,
+            ticket,
+            history,
+            modelMaxTokens: 12000,
+            responseTokens: 500,
+          });
+
+          // 3) Ask model with full context
+          const aiResp = await openai.chat.completions.create({
+            model: "gpt-3.5-turbo",
+            messages: oaMessages,
+            max_tokens: 500,
+            temperature: 0.4,
+          });
+
+          const raw = aiResp?.choices?.[0]?.message?.content?.trim() || "";
+          let parsed;
+          try {
+            parsed = JSON.parse(raw);
+          } catch {
+            parsed = {
+              reply: raw || "Thanks—let me check that for you.",
+              sentiment: "neutral",
+              flagged: false,
+              keywords: [],
+            };
+          }
+
+          // normalize + auto-flag if upset
+          const botText = (parsed.reply || "").toString().slice(0, 4000);
+          const sentiment = (parsed.sentiment || "neutral").toString();
+          let flagged = Boolean(parsed.flagged);
+          const keywords = Array.isArray(parsed.keywords)
+            ? parsed.keywords
+            : [];
+          if (sentiment.toLowerCase() === "upset") flagged = true;
+
+          // Post bot message
+          await addMessage({
+            ticketId,
+            authorType: "bot",
+            authorName: "AutoBot",
+            text: botText,
+            triggerAI: false, // don't recurse
+          });
+
+          // Persist AI analysis on ticket
+          try {
+            ticket.sentiment = sentiment;
+            ticket.keywords = keywords;
+            ticket.analyzedAt = new Date();
+            if (flagged) {
+              ticket.flagged = true;
+              ticket.flaggedAt = new Date();
+            }
+            await ticket.save();
+
+            // real-time meta (includes flag fields) + staff toast
+            emitTicketMeta(ticket);
+            if (flagged) {
+              io.to("support").emit("ticket:flagged", {
+                ticketId: String(ticketId),
+                sentiment,
+                flagged: true,
+                keywords,
+                flaggedAt: ticket.flaggedAt,
+              });
+            }
+          } catch (e) {
+            console.error("Ticket save (analysis) error:", e?.message || e);
+          }
+        } catch (e) {
+          console.error("OpenAI reply error:", e?.message || e);
+        }
+      })();
+    }
+  }
+
+  return payload;
+}
+
+// ---------- REST: test ticket ----------
 app.post("/api/test-ticket", async (req, res) => {
   try {
     const {
@@ -127,7 +383,7 @@ app.post("/api/test-ticket", async (req, res) => {
   }
 });
 
-// --- REST: create real ticket (used by chat “Start Chat”) ---
+// ---------- REST: create ticket (welcome + initial issue + AI) ----------
 app.post("/api/tickets", async (req, res) => {
   try {
     const {
@@ -150,45 +406,33 @@ app.post("/api/tickets", async (req, res) => {
 
     activateAgentTickets.delete(String(ticket._id));
 
-    // Persist a bot welcome message so it shows for both user & staff
+    // 1) Welcome bot
     const welcomeText =
       "🤖 Chatbot will triage your issue and a specialist will join shortly.";
-    const botMsg = await ChatMessage.create({
+    await addMessage({
       ticketId: ticket._id,
       authorType: "bot",
       authorName: "AutoBot",
       text: welcomeText,
+      triggerAI: false,
     });
 
-    // Update denorm fields for dashboards
-    ticket.lastMessageAt = botMsg.createdAt;
-    ticket.lastMessageSnippet = welcomeText.slice(0, 120);
-    ticket.messageCount = (ticket.messageCount || 0) + 1;
-    await ticket.save();
+    // 2) User initial message (title/description/city) + trigger AI
+    const initialUserText =
+      `**Issue:** ${title}\n\n` +
+      `**Details:** ${description || "(no description)"}\n\n` +
+      `**City:** ${city}`;
+    await addMessage({
+      ticketId: ticket._id,
+      authorType: "user",
+      authorName: requesterName,
+      text: initialUserText,
+      triggerAI: true,
+    });
 
-    // Broadcast bot message (normalize)
-    const payload = {
-      _id: botMsg._id,
-      ticketId: String(botMsg.ticketId),
-      authorType: botMsg.authorType,
-      authorName: botMsg.authorName,
-      text: botMsg.text,
-      createdAt: botMsg.createdAt,
-      updatedAt: botMsg.updatedAt,
-    };
-    io.to(`ticket:${ticket._id}`).emit("chat:new", payload);
-    io.to("support").emit("chat:new", payload);
-
-    // Global meta + stats
     happiness = Math.max(0, happiness - 5);
     io.emit("happiness:update", { happiness });
     io.emit("ticket:created", ticket);
-    io.emit("ticket:meta", {
-      id: String(ticket._id),
-      messageCount: ticket.messageCount,
-      lastMessageSnippet: ticket.lastMessageSnippet,
-      lastMessageAt: ticket.lastMessageAt,
-    });
     await computeAndEmitStats();
 
     res.json({ success: true, ticket });
@@ -198,9 +442,7 @@ app.post("/api/tickets", async (req, res) => {
   }
 });
 
-// --- REST: append chat message ---
-const activateAgentTickets = new Map();
-
+// ---------- REST: append chat message ----------
 app.post("/api/tickets/:id/chat", async (req, res) => {
   try {
     const id = String(req.params.id || "").trim();
@@ -216,121 +458,22 @@ app.post("/api/tickets/:id/chat", async (req, res) => {
         .json({ success: false, message: "Invalid ticket id" });
     }
     const ticket = await Ticket.findById(id);
-    if (!ticket)
+    if (!ticket) {
       return res
         .status(404)
         .json({ success: false, message: "Ticket not found" });
-    if (!text.trim())
+    }
+    if (!text.trim()) {
       return res.status(400).json({ success: false, message: "Text required" });
+    }
 
-    const message = await ChatMessage.create({
-      ticketId: new mongoose.Types.ObjectId(id), // explicit cast
+    const payload = await addMessage({
+      ticketId: id,
       authorType,
       authorName,
       text,
+      triggerAI: authorType === "user",
     });
-
-    // Update denorm fields for dashboards
-    ticket.lastMessageAt = message.createdAt;
-    ticket.lastMessageSnippet = text.slice(0, 120);
-    ticket.messageCount = (ticket.messageCount || 0) + 1;
-    await ticket.save();
-
-    // Broadcast (normalize ticketId to string)
-    const room = `ticket:${id}`;
-    const payload = {
-      _id: message._id,
-      ticketId: String(message.ticketId),
-      authorType: message.authorType,
-      authorName: message.authorName,
-      text: message.text,
-      createdAt: message.createdAt,
-      updatedAt: message.updatedAt,
-    };
-
-    io.to(room).emit("chat:new", payload);
-    io.to("support").emit("chat:new", payload);
-
-    // Also push meta so lists can update counts/snippets
-    io.emit("ticket:meta", {
-      id: String(ticket._id),
-      messageCount: ticket.messageCount,
-      lastMessageSnippet: ticket.lastMessageSnippet,
-      lastMessageAt: ticket.lastMessageAt,
-    });
-
-    if (authorType === "agent" || authorType === "staff") {
-      activateAgentTickets.set(id, Date.now());
-    }
-
-    // Spawn an asynchronous job to generate an AI reply (fire-and-forget).
-    // This keeps the user-facing request fast while still producing a bot reply
-    // that will be persisted and emitted when ready. Requires OPENAI_API_KEY.
-    (async () => {
-      try {
-        if (!openai) return; // OpenAI not configured
-        if (authorType !== "user") return;
-
-        const agentLastActive = activateAgentTickets.get(id);
-        if (agentLastActive && Date.now() - agentLastActive < 5 * 60 * 1000) {
-          return;
-        } 
-
-        // Build a small prompt; can be expanded to include recent history later.
-        const systemPrompt =
-          "You are a T-Mobile customer support assistant. Only answer questions related to T-Mobile services, accounts, billing, technical support, or store information. If asked about unrelated topics (such as games, entertainment, or anything not about T-Mobile), reply: 'Sorry, I can only assist with T-Mobile related questions.'";"You are a T-Mobile customer support assistant. Only answer questions related to T-Mobile services, accounts, billing, technical support, or store information. If asked about unrelated topics (such as games, entertainment, or anything not about T-Mobile), reply: 'Sorry, I can only assist with T-Mobile related questions.'";
-
-        const aiResp = await openai.chat.completions.create({
-          model: "gpt-3.5-turbo",
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: text },
-          ],
-          max_tokens: 1000,
-          temperature: 0.8,
-        });
-
-        const botText =
-          aiResp?.choices?.[0]?.message?.content?.trim() ||
-          (aiResp?.choices?.[0]?.delta?.content ?? null);
-        if (!botText) return;
-
-        const botMsg = await ChatMessage.create({
-          ticketId: new mongoose.Types.ObjectId(id),
-          authorType: "bot",
-          authorName: "AutoBot",
-          text: botText,
-        });
-
-        // Update ticket denorm fields
-        ticket.lastMessageAt = botMsg.createdAt;
-        ticket.lastMessageSnippet = botMsg.text.slice(0, 120);
-        ticket.messageCount = (ticket.messageCount || 0) + 1;
-        await ticket.save();
-
-        const botPayload = {
-          _id: botMsg._id,
-          ticketId: String(botMsg.ticketId),
-          authorType: botMsg.authorType,
-          authorName: botMsg.authorName,
-          text: botMsg.text,
-          createdAt: botMsg.createdAt,
-          updatedAt: botMsg.updatedAt,
-        };
-
-        io.to(`ticket:${id}`).emit("chat:new", botPayload);
-        io.to("support").emit("chat:new", botPayload);
-
-        io.emit("ticket:meta", {
-          id: String(ticket._id),
-          messageCount: ticket.messageCount,
-          lastMessageSnippet: ticket.lastMessageSnippet,
-          lastMessageAt: ticket.lastMessageAt,
-        });
-      } catch (e) {
-        console.error("OpenAI reply error:", e?.message || e);
-      }
-    })();
 
     res.json({ success: true, message: payload });
   } catch (err) {
@@ -339,7 +482,7 @@ app.post("/api/tickets/:id/chat", async (req, res) => {
   }
 });
 
-// --- REST: ticket message history (NEW) ---
+// ---------- REST: ticket message history ----------
 app.get("/api/tickets/:id/messages", async (req, res) => {
   try {
     const id = String(req.params.id || "").trim();
@@ -368,12 +511,38 @@ app.get("/api/tickets/:id/messages", async (req, res) => {
   }
 });
 
-// --- REST: close ticket (hardened) ---
+// ---------- REST: toggle flag (real-time broadcast) ----------
+app.patch("/api/tickets/:id/flag", async (req, res) => {
+  try {
+    const id = String(req.params.id || "");
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid ticket id" });
+    }
+    const ticket = await Ticket.findById(id);
+    if (!ticket)
+      return res
+        .status(404)
+        .json({ success: false, message: "Ticket not found" });
+
+    const { flagged = false } = req.body || {};
+    ticket.flagged = Boolean(flagged);
+    ticket.flaggedAt = ticket.flagged ? new Date() : null;
+    await ticket.save();
+
+    emitTicketMeta(ticket);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Flag toggle error:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ---------- REST: close ticket ----------
 app.patch("/api/tickets/:id/close", async (req, res) => {
   try {
     const id = String(req.params.id || "").trim();
-    console.log("Close attempt:", { id, len: id.length });
-
     if (!mongoose.Types.ObjectId.isValid(id)) {
       return res
         .status(404)
@@ -400,12 +569,7 @@ app.patch("/api/tickets/:id/close", async (req, res) => {
     await ticket.save();
 
     io.emit("ticket:closed", { _id: ticket._id, title: ticket.title });
-    io.emit("ticket:meta", {
-      id: String(ticket._id),
-      messageCount: ticket.messageCount,
-      lastMessageSnippet: ticket.lastMessageSnippet,
-      lastMessageAt: ticket.lastMessageAt,
-    });
+    emitTicketMeta(ticket);
     await computeAndEmitStats();
 
     return res.json({ success: true, _id: ticket._id });
@@ -415,7 +579,7 @@ app.patch("/api/tickets/:id/close", async (req, res) => {
   }
 });
 
-// --- REST: list tickets ---
+// ---------- List tickets ----------
 app.get("/api/tickets", async (_req, res) => {
   try {
     const tickets = await Ticket.find().sort({ createdAt: -1 });
@@ -429,32 +593,57 @@ app.get("/", (_req, res) => {
   res.send("Server is running ✅");
 });
 
-// --- WebSocket connection event ---
+// ---------- Socket.IO connection: send backlog on join ----------
 io.on("connection", async (socket) => {
   console.log(`🟢 Client connected: ${socket.id}`);
   socket.emit("happiness:update", { happiness });
   await computeAndEmitStats();
 
-  socket.on("join", (data = {}) => {
-    const { role, ticketId } = data;
-    if (role === "staff") {
-      socket.join("support");
-      console.log(`👥 ${socket.id} joined room: support`);
-    }
-    if (ticketId) {
-      const room = `ticket:${String(ticketId)}`;
-      socket.join(room);
-      socket.emit("joined", { room });
-      console.log(`🧵 ${socket.id} joined room: ${room}`);
+  socket.on("join", async (data = {}) => {
+    try {
+      const { role, ticketId } = data;
+
+      if (role === "staff") {
+        socket.join("support");
+        console.log(`👥 ${socket.id} joined room: support`);
+      }
+
+      if (ticketId && mongoose.Types.ObjectId.isValid(String(ticketId))) {
+        const room = `ticket:${String(ticketId)}`;
+        socket.join(room);
+        socket.emit("joined", { room });
+        console.log(`🧵 ${socket.id} joined room: ${room}`);
+
+        // Send backlog immediately so client never misses AI replies
+        const msgs = await ChatMessage.find({
+          ticketId: new mongoose.Types.ObjectId(String(ticketId)),
+        })
+          .sort({ createdAt: 1 })
+          .limit(500);
+
+        const normalized = msgs.map((m) => ({
+          _id: String(m._id),
+          ticketId: String(m.ticketId),
+          authorType: m.authorType,
+          authorName: m.authorName,
+          text: m.text,
+          createdAt: m.createdAt,
+          updatedAt: m.updatedAt,
+        }));
+
+        socket.emit("chat:history", normalized);
+      }
+    } catch (e) {
+      console.error("join handler error:", e?.message || e);
     }
   });
 
-  socket.on("disconnect", () =>
-    console.log(`🔴 Client disconnected: ${socket.id}`)
-  );
+  socket.on("disconnect", () => {
+    console.log(`🔴 Client disconnected: ${socket.id}`);
+  });
 });
 
-// --- Start server ---
+// ---------- Start server ----------
 const PORT = process.env.PORT || 4000;
 try {
   await connectDB();

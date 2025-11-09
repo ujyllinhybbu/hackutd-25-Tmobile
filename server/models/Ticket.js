@@ -3,7 +3,7 @@ import mongoose from "mongoose";
 
 const TicketSchema = new mongoose.Schema(
   {
-    title: { type: String, required: true, trim: true },
+    title: { type: String, required: true },
     description: { type: String, default: "" },
     city: { type: String, default: "Unknown" },
 
@@ -11,40 +11,39 @@ const TicketSchema = new mongoose.Schema(
       type: String,
       enum: ["minor", "major", "critical"],
       default: "minor",
-      index: true,
     },
-
     status: {
       type: String,
-      enum: ["open", "investigating", "escalated", "fixed"],
+      enum: ["open", "fixed"],
       default: "open",
-      index: true,
     },
 
-    flagged: { type: Boolean, default: false },
+    createdBy: { type: String, default: "Guest" },
 
-    // relationships / metadata
-    createdBy: { type: String, default: "Guest" }, // requester display name
-    assignedTo: { type: String, default: "" }, // agent display name
-
-    // denormalized chat fields for dashboards
-    lastMessageSnippet: { type: String, default: "" },
-    lastMessageAt: { type: Date },
+    // denormalized chat meta
     messageCount: { type: Number, default: 0 },
+    lastMessageSnippet: { type: String, default: "" },
+    lastMessageAt: { type: Date, default: null },
+    closedAt: { type: Date, default: null },
 
-    // resolution metrics
-    resolvedAt: { type: Date },
-    timeSpentMs: { type: Number, default: 0 },
+    // ---- AI analysis fields ----
+    flagged: { type: Boolean, default: false },
+    flaggedAt: { type: Date, default: null },
+    sentiment: {
+      type: String,
+      enum: ["neutral", "upset", "happy", "confused"],
+      default: "neutral",
+    },
+    keywords: { type: [String], default: [] },
+    analyzedAt: { type: Date, default: null },
   },
   { timestamps: true }
 );
 
-// Guard: resolvedAt implies status fixed
-TicketSchema.pre("validate", function (next) {
-  if (this.resolvedAt && this.status !== "fixed") {
-    return next(new Error("resolvedAt can only be set when status is 'fixed'"));
-  }
-  next();
-});
+// Helpful indexes for dashboards/filters
+TicketSchema.index({ status: 1, severity: 1, updatedAt: -1 });
+TicketSchema.index({ flagged: 1, updatedAt: -1 });
+TicketSchema.index({ keywords: 1 });
 
-export default mongoose.models.Ticket || mongoose.model("Ticket", TicketSchema);
+const Ticket = mongoose.model("Ticket", TicketSchema);
+export default Ticket;

@@ -189,12 +189,13 @@ export default function useSupportPanel(options = {}) {
         const t = { ...updated[idx] };
         t.lastMessageSnippet = msg.text.slice(0, 120);
         t.lastMessageAt = new Date(msg.ts);
-        t.messageCount = (t.messageCount || 0) + 1; // will be corrected by ticket:meta
+        t.messageCount = (t.messageCount || 0) + 1; // corrected by ticket:meta
         updated.splice(idx, 1);
         return [t, ...updated];
       });
     };
 
+    // 🔴 REAL-TIME META (includes flag fields now)
     const handleTicketMeta = (meta) => {
       const id = String(meta.id);
       setTickets((prev) =>
@@ -208,6 +209,39 @@ export default function useSupportPanel(options = {}) {
                 lastMessageAt: meta.lastMessageAt
                   ? new Date(meta.lastMessageAt)
                   : t.lastMessageAt,
+                // NEW: live moderation/AI fields
+                flagged:
+                  typeof meta.flagged === "boolean" ? meta.flagged : t.flagged,
+                flaggedAt: meta.flaggedAt
+                  ? new Date(meta.flaggedAt)
+                  : t.flaggedAt,
+                sentiment: meta.sentiment ?? t.sentiment,
+                keywords: Array.isArray(meta.keywords)
+                  ? meta.keywords
+                  : t.keywords,
+              }
+            : t
+        )
+      );
+    };
+
+    // Optional: separate event when server flags (for toasts/badges)
+    const handleTicketFlagged = ({
+      ticketId,
+      sentiment,
+      keywords,
+      flaggedAt,
+    }) => {
+      const id = String(ticketId);
+      setTickets((prev) =>
+        prev.map((t) =>
+          String(t._id) === id
+            ? {
+                ...t,
+                flagged: true,
+                flaggedAt: flaggedAt ? new Date(flaggedAt) : new Date(),
+                sentiment: sentiment ?? t.sentiment,
+                keywords: Array.isArray(keywords) ? keywords : t.keywords,
               }
             : t
         )
@@ -225,11 +259,13 @@ export default function useSupportPanel(options = {}) {
 
     socket.on("chat:new", handleChatNew);
     socket.on("ticket:meta", handleTicketMeta);
+    socket.on("ticket:flagged", handleTicketFlagged);
     socket.on("ticket:created", handleTicketCreated);
 
     return () => {
       socket.off("chat:new", handleChatNew);
       socket.off("ticket:meta", handleTicketMeta);
+      socket.off("ticket:flagged", handleTicketFlagged);
       socket.off("ticket:created", handleTicketCreated);
       socket.disconnect();
       socketRef.current = null;
@@ -277,7 +313,7 @@ export default function useSupportPanel(options = {}) {
       if (qnorm) {
         const blob = `${t.title || ""} ${t.city || ""} ${
           t.lastMessageSnippet || ""
-        }`.toLowerCase();
+        } ${(t.keywords || []).join(" ")}`.toLowerCase(); // include keywords in search
         if (!blob.includes(qnorm)) return false;
       }
       return true;
