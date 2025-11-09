@@ -18,10 +18,21 @@ import {
   Activity,
   MessageSquareWarning,
   Info,
+  // extra icons used by AI panel
+  Smile,
+  Frown,
+  HelpCircle,
+  Gauge,
+  ClipboardCopy,
+  Sparkles,
+  Tag,
+  Bot,
+  MessageSquareText,
+  UserRound,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 
-/** --- Theme (T‑Mobile inspired) --- */
+/** --- Theme (T-Mobile inspired) --- */
 const T = {
   magenta: "#E20074",
   magentaLight: "#FF77C8",
@@ -148,136 +159,424 @@ function CountChip({ icon: Icon, label }) {
   );
 }
 
-/* ---------- Analysis Modal ---------- */
-function AnalysisModal({ open, onClose, summary }) {
-  if (!open) return null;
+/* ========================================================================
+   AI Analysis Panel (polished, icon-forward)
+   ======================================================================== */
+
+const sentimentMeta = (s = "neutral") => {
+  const v = String(s).toLowerCase();
+  if (v === "happy")
+    return {
+      label: "Happy",
+      icon: Smile,
+      bg: "bg-emerald-50",
+      fg: "text-emerald-700",
+      dot: "bg-emerald-500",
+      bar: "bg-emerald-500",
+      score: +5,
+    };
+  if (v === "upset")
+    return {
+      label: "Upset",
+      icon: Frown,
+      bg: "bg-rose-50",
+      fg: "text-rose-700",
+      dot: "bg-rose-500",
+      bar: "bg-rose-500",
+      score: -5,
+    };
+  if (v === "confused")
+    return {
+      label: "Confused",
+      icon: HelpCircle,
+      bg: "bg-amber-50",
+      fg: "text-amber-700",
+      dot: "bg-amber-500",
+      bar: "bg-amber-500",
+      score: -2,
+    };
+  return {
+    label: "Neutral",
+    icon: Gauge,
+    bg: "bg-slate-50",
+    fg: "text-slate-700",
+    dot: "bg-slate-400",
+    bar: "bg-slate-400",
+    score: 0,
+  };
+};
+
+function Chip({ children, className }) {
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center p-4">
-      <motion.div
-        initial={{ opacity: 0, y: 12, scale: 0.98 }}
-        animate={{ opacity: 1, y: 0, scale: 1 }}
-        exit={{ opacity: 0, y: 12, scale: 0.98 }}
-        transition={{ type: "spring", stiffness: 300, damping: 28 }}
-        className="w-full max-w-xl rounded-2xl border shadow-2xl"
-        style={{ background: "rgba(255,255,255,0.94)", borderColor: T.stroke }}
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-semibold",
+        className
+      )}
+    >
+      {children}
+    </span>
+  );
+}
+
+function BadgeRow({ summary }) {
+  const st = String(summary?.status || "open");
+  const sev = String(summary?.severity || "minor");
+  const sevTone = toneBySeverity(sev);
+  const isFixed = st === "fixed";
+  return (
+    <div className="flex flex-wrap gap-2">
+      <Chip
+        className={cn(
+          "text-white",
+          isFixed ? "bg-emerald-600" : "bg-slate-800"
+        )}
       >
-        <div
-          className="flex items-center justify-between p-3 border-b"
-          style={{ borderColor: T.stroke }}
-        >
-          <div
-            className="inline-flex items-center gap-2 text-sm font-semibold"
-            style={{ color: T.magenta }}
-          >
-            <Wand2 className="h-4 w-4" /> AI Analysis
-          </div>
-          <button
-            onClick={onClose}
-            className="rounded-lg p-1"
-            aria-label="Close analysis dialog"
-          >
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-
-        <div className="p-4 space-y-3 text-sm text-slate-800">
-          <div
-            className="font-semibold text-base truncate"
-            title={summary.title}
-          >
-            {summary.title}
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <div
-              className="rounded-xl p-3 border bg-white"
-              style={{ borderColor: T.stroke }}
-            >
-              <div className="text-[11px] text-slate-500 mb-1">Ticket</div>
-              <div>
-                Severity: <b>{summary.severity}</b>
-              </div>
-              <div>
-                Status: <b>{summary.status}</b>
-              </div>
-              {summary.city && (
-                <div>
-                  City: <b>{summary.city}</b>
-                </div>
-              )}
-              <div>
-                Age: <b>{summary.ageHuman}</b>
-              </div>
-              <div>
-                Last Activity: <b>{summary.lastAtHuman}</b>
-              </div>
-            </div>
-            <div
-              className="rounded-xl p-3 border bg-white"
-              style={{ borderColor: T.stroke }}
-            >
-              <div className="text-[11px] text-slate-500 mb-1">
-                Conversation
-              </div>
-              <div>
-                Messages: <b>{summary.msgCount}</b>
-              </div>
-              <div>
-                User: <b>{summary.userCount}</b>
-              </div>
-              <div>
-                Staff: <b>{summary.staffCount}</b>
-              </div>
-              <div>
-                Bot: <b>{summary.botCount}</b>
-              </div>
-            </div>
-          </div>
-
-          <div
-            className="rounded-xl p-3 border bg-white"
-            style={{ borderColor: T.stroke }}
-          >
-            <div className="text-[11px] text-slate-500 mb-1">Signals</div>
-            <ul className="list-disc pl-5 space-y-1">
-              {summary.signals?.map((s, i) => (
-                <li key={i}>{s}</li>
-              ))}
-            </ul>
-          </div>
-
-          <div
-            className="rounded-xl p-3 border bg-white"
-            style={{ borderColor: T.stroke }}
-          >
-            <div className="text-[11px] text-slate-500 mb-1">
-              Suggested Next Action
-            </div>
-            <div>{summary.nextAction}</div>
-          </div>
-        </div>
-
-        <div
-          className="p-3 border-t flex justify-end"
-          style={{ borderColor: T.stroke }}
-        >
-          <button
-            onClick={onClose}
-            className="px-3 py-2 rounded-xl text-white text-sm"
-            style={{
-              background: T.magenta,
-              boxShadow: "0 6px 20px rgba(226,0,116,0.35)",
-            }}
-          >
-            Close
-          </button>
-        </div>
-      </motion.div>
+        {isFixed ? (
+          <CheckCircle2 className="h-3.5 w-3.5" />
+        ) : (
+          <Activity className="h-3.5 w-3.5" />
+        )}
+        {isFixed ? "Fixed" : "Open"}
+      </Chip>
+      <Chip className={sevTone.chip}>
+        <AlertTriangle className="h-3.5 w-3.5" /> {sev}
+      </Chip>
+      {summary?.city && (
+        <Chip className="bg-slate-100 text-slate-800">
+          <MapPin className="h-3.5 w-3.5" /> {summary.city}
+        </Chip>
+      )}
+      {summary?.flagged && (
+        <Chip className="bg-rose-600 text-white">
+          <Flag className="h-3.5 w-3.5" /> Flagged
+        </Chip>
+      )}
     </div>
   );
 }
 
-/* ---------- Ticket Row (icon‑first, compact) ---------- */
+function SentimentMeter({ sentiment = "neutral", score = 0 }) {
+  const m = sentimentMeta(sentiment);
+  const pct = Math.max(0, Math.min(100, (score + 5) * 10)); // map -5..+5 → 0..100
+  return (
+    <div
+      className={cn("rounded-xl p-3 border", m.bg)}
+      style={{ borderColor: T.stroke }}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <div
+          className={cn(
+            "inline-flex items-center gap-1.5 text-sm font-semibold",
+            m.fg
+          )}
+        >
+          <m.icon className="h-4 w-4" />
+          Sentiment: {m.label}
+        </div>
+        <div className="text-xs text-slate-500">
+          Score {score >= 0 ? "+" : ""}
+          {score}
+        </div>
+      </div>
+      <div
+        className="mt-2 h-2.5 rounded-full bg-white border"
+        style={{ borderColor: T.stroke }}
+      >
+        <div
+          className={cn("h-full rounded-full", m.bar)}
+          style={{ width: `${pct}%`, transition: "width 300ms ease" }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function KV({ label, value, icon: Icon }) {
+  return (
+    <div className="flex items-center gap-2 text-sm">
+      <Icon className="h-4 w-4 text-slate-500" />
+      <span className="text-slate-500">{label}:</span>
+      <span className="font-medium text-slate-800">{value ?? "—"}</span>
+    </div>
+  );
+}
+
+function KeywordChips({ items = [] }) {
+  if (!items.length)
+    return <div className="text-sm text-slate-500">No keywords extracted.</div>;
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {items.map((k, i) => (
+        <span
+          key={`${k}-${i}`}
+          className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-full border bg-white"
+          style={{ borderColor: T.stroke }}
+          title={k}
+        >
+          <Tag className="h-3.5 w-3.5 text-slate-500" />
+          {k}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function SignalsList({ items = [] }) {
+  return (
+    <ul className="list-none space-y-1.5">
+      {items.length ? (
+        items.map((s, i) => (
+          <li key={i} className="text-sm flex items-start gap-2">
+            <Info className="h-4 w-4 mt-0.5 text-slate-500" />
+            <span className="text-slate-800">{s}</span>
+          </li>
+        ))
+      ) : (
+        <li className="text-sm flex items-start gap-2 text-slate-600">
+          <Sparkles className="h-4 w-4 mt-0.5" /> No risk signals detected.
+        </li>
+      )}
+    </ul>
+  );
+}
+
+function PeopleStats({ summary }) {
+  return (
+    <div className="grid grid-cols-3 gap-3">
+      <div
+        className="rounded-xl p-3 border bg-white"
+        style={{ borderColor: T.stroke }}
+      >
+        <div className="text-[11px] text-slate-500 mb-1">Messages</div>
+        <div className="flex items-center gap-2">
+          <MessageSquare className="h-4 w-4 text-slate-500" />
+          <b className="text-slate-800">{summary?.msgCount ?? 0}</b>
+        </div>
+      </div>
+      <div
+        className="rounded-xl p-3 border bg-white"
+        style={{ borderColor: T.stroke }}
+      >
+        <div className="text-[11px] text-slate-500 mb-1">User</div>
+        <div className="flex items-center gap-2">
+          <UserRound className="h-4 w-4 text-slate-500" />
+          <b className="text-slate-800">{summary?.userCount ?? 0}</b>
+        </div>
+      </div>
+      <div
+        className="rounded-xl p-3 border bg-white"
+        style={{ borderColor: T.stroke }}
+      >
+        <div className="text-[11px] text-slate-500 mb-1">Staff/Bot</div>
+        <div className="flex items-center gap-2">
+          <MessageSquareText className="h-4 w-4 text-slate-500" />
+          <b className="text-slate-800">
+            {(summary?.staffCount ?? 0) + (summary?.botCount ?? 0)}
+          </b>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AIAnalysisPanel({ open, onClose, summary = {}, onCopy }) {
+  const sMeta = sentimentMeta(summary.sentiment || "neutral");
+  const score = Number(summary.aiScore ?? sMeta?.score ?? 0);
+
+  return (
+    <AnimatePresence>
+      {open && (
+        <div className="fixed inset-0 z-50 p-3 sm:p-6 grid place-items-center">
+          {/* Backdrop */}
+          <motion.div
+            className="absolute inset-0 bg-black/20"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+          />
+          {/* Panel */}
+          <motion.div
+            role="dialog"
+            aria-modal="true"
+            aria-label="AI Analysis"
+            initial={{ opacity: 0, y: 18, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 18, scale: 0.98 }}
+            transition={{ type: "spring", stiffness: 320, damping: 26 }}
+            className="relative w-full max-w-3xl rounded-2xl border shadow-2xl"
+            style={{
+              background: "rgba(255,255,255,0.94)",
+              borderColor: T.stroke,
+            }}
+          >
+            {/* Header */}
+            <div
+              className="flex items-center justify-between gap-2 p-3 sm:p-4 border-b"
+              style={{ borderColor: T.stroke }}
+            >
+              <div
+                className="flex items-center gap-2 text-sm font-semibold"
+                style={{ color: T.magenta }}
+              >
+                <Wand2 className="h-4 w-4" />
+                AI Analysis
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => {
+                    const text =
+                      `Summary: ${summary.title || "Untitled"}\n` +
+                      `Sentiment: ${
+                        summary.sentiment || "neutral"
+                      } (${score})\n` +
+                      (summary.aiSummary ? `\n${summary.aiSummary}` : "");
+                    navigator.clipboard.writeText(text).catch(() => {});
+                    onCopy?.();
+                  }}
+                  className="rounded-lg p-1.5 border bg-white text-slate-700 hover:bg-slate-50"
+                  style={{ borderColor: T.stroke }}
+                  title="Copy summary"
+                >
+                  <ClipboardCopy className="h-4 w-4" />
+                </button>
+                <button
+                  onClick={onClose}
+                  className="rounded-lg p-1.5"
+                  aria-label="Close"
+                >
+                  <X className="h-5 w-5 text-slate-700" />
+                </button>
+              </div>
+            </div>
+
+            {/* Body */}
+            <div className="p-3 sm:p-4 md:p-5 space-y-4">
+              {/* Title + badges */}
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div
+                    className="text-base sm:text-lg font-semibold text-slate-900 truncate"
+                    title={summary.title}
+                  >
+                    {summary.title || "Untitled Ticket"}
+                  </div>
+                  <div className="mt-2">
+                    <BadgeRow summary={summary} />
+                  </div>
+                </div>
+              </div>
+
+              {/* Sentiment + Meta */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <div className="md:col-span-2">
+                  <SentimentMeter sentiment={summary.sentiment} score={score} />
+                </div>
+                <div
+                  className="rounded-xl p-3 border bg-white"
+                  style={{ borderColor: T.stroke }}
+                >
+                  <div className="text-[11px] text-slate-500 mb-1">Meta</div>
+                  <div className="space-y-1">
+                    <KV label="Age" value={summary.ageHuman} icon={Clock} />
+                    <KV
+                      label="Last Activity"
+                      value={summary.lastAtHuman}
+                      icon={Activity}
+                    />
+                    {summary.city && (
+                      <KV label="City" value={summary.city} icon={MapPin} />
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Conversation stats */}
+              <PeopleStats summary={summary} />
+
+              {/* Keywords + Signals */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div
+                  className="rounded-xl p-3 border bg-white"
+                  style={{ borderColor: T.stroke }}
+                >
+                  <div className="text-[11px] text-slate-500 mb-1 inline-flex items-center gap-1">
+                    <Tag className="h-4 w-4" /> Keywords
+                  </div>
+                  <KeywordChips
+                    items={summary.keywords || summary.aiKeywords || []}
+                  />
+                </div>
+                <div
+                  className="rounded-xl p-3 border bg-white"
+                  style={{ borderColor: T.stroke }}
+                >
+                  <div className="text-[11px] text-slate-500 mb-1 inline-flex items-center gap-1">
+                    <Info className="h-4 w-4" /> Signals
+                  </div>
+                  <SignalsList items={summary.signals || []} />
+                </div>
+              </div>
+
+              {/* AI Summary (compact) */}
+              {summary.aiSummary && (
+                <div
+                  className="rounded-xl p-3 border bg-white"
+                  style={{ borderColor: T.stroke }}
+                >
+                  <div className="text-[11px] text-slate-500 mb-1 inline-flex items-center gap-1">
+                    <Bot className="h-4 w-4" /> AI Summary
+                  </div>
+                  <div className="text-sm text-slate-800 whitespace-pre-wrap leading-relaxed">
+                    {summary.aiSummary}
+                  </div>
+                </div>
+              )}
+
+              {/* Next Action */}
+              <div
+                className="rounded-xl p-3 border"
+                style={{
+                  borderColor: T.stroke,
+                  background: "rgba(226,0,116,0.06)",
+                }}
+              >
+                <div className="text-[11px] text-slate-600 mb-1 inline-flex items-center gap-1">
+                  <Check className="h-4 w-4" /> Suggested Next Action
+                </div>
+                <div className="text-sm text-slate-900">
+                  {summary.nextAction || "No action required."}
+                </div>
+              </div>
+            </div>
+
+            {/* Footer */}
+            <div
+              className="p-3 sm:p-4 border-t flex justify-end"
+              style={{ borderColor: T.stroke }}
+            >
+              <button
+                onClick={onClose}
+                className="px-3 py-2 rounded-xl text-white text-sm"
+                style={{
+                  background: T.magenta,
+                  boxShadow: "0 6px 20px rgba(226,0,116,0.35)",
+                }}
+              >
+                Close
+              </button>
+            </div>
+          </motion.div>
+        </div>
+      )}
+    </AnimatePresence>
+  );
+}
+
+/* ========================================================================
+   Ticket Row (icon-first, compact)
+   ======================================================================== */
+
 function TicketRow({ t, active, onClick, onAnalyze, onFlag, analyzing }) {
   const isOpen = t.status !== "fixed";
   const flagged = !!t.flagged;
@@ -553,7 +852,7 @@ export default function Support() {
     [tickets.length, openCount, fixedCount]
   );
 
-  // ---- lightweight client analysis
+  // ---- lightweight client analysis (uses your existing /messages route)
   const analyzeTicket = async (ticket) => {
     try {
       setAnalyzingId(ticket._id);
@@ -631,6 +930,16 @@ export default function Support() {
         botCount,
         signals: signals.length ? signals : ["No risk signals detected."],
         nextAction,
+        // pull AI fields if your server saved them
+        sentiment: ticket.aiSentiment || ticket.sentiment || "neutral",
+        aiKeywords: ticket.aiKeywords || ticket.keywords || [],
+        aiSummary: ticket.aiSummary || "",
+        flagged: !!ticket.flagged,
+        aiScore:
+          (ticket.aiSentiment === "happy" && 5) ||
+          (ticket.aiSentiment === "upset" && -5) ||
+          (ticket.aiSentiment === "confused" && -2) ||
+          0,
       });
       setAnalysisOpen(true);
     } catch (e) {
@@ -839,7 +1148,7 @@ export default function Support() {
             </div>
           </div>
 
-          {/* Thread (self‑scrolling) */}
+          {/* Thread (self-scrolling) */}
           <div
             ref={listRef}
             className="flex-1 min-h-0 overflow-y-auto py-3 space-y-2.5"
@@ -884,13 +1193,11 @@ export default function Support() {
       </main>
 
       {/* Analysis Modal */}
-      <AnimatePresence>
-        <AnalysisModal
-          open={analysisOpen}
-          onClose={() => setAnalysisOpen(false)}
-          summary={analysis || {}}
-        />
-      </AnimatePresence>
+      <AIAnalysisPanel
+        open={analysisOpen}
+        onClose={() => setAnalysisOpen(false)}
+        summary={analysis || {}}
+      />
     </div>
   );
 }

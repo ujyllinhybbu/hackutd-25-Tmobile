@@ -6,6 +6,7 @@ import {
   CardHeader,
   CardTitle,
 } from "../components/ui/card";
+import SolvedIssues from "../components/SolvedIssues.jsx";
 import { Button } from "../components/ui/button";
 import { Alert, AlertDescription, AlertTitle } from "../components/ui/alert";
 import {
@@ -689,6 +690,7 @@ export default function DashboardDemo() {
             </CardContent>
           </Card>
         </div>
+        <SolvedIssues limit={12} />
       </main>
 
       {/* Footer */}

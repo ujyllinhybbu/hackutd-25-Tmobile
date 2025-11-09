@@ -9,6 +9,7 @@ import { connectDB } from "./db/connectToDB.js";
 import Ticket from "./models/Ticket.js";
 import ChatMessage from "./models/ChatMessage.js";
 import metricsRouter from "./metrics.js";
+import solvedTicketsRouter from "./routes/solved-tickets.js";
 
 dotenv.config();
 
@@ -33,23 +34,21 @@ app.use((req, _res, next) => {
 app.use(express.json());
 app.use(express.static("public"));
 app.use("/api", metricsRouter);
+app.use("/api", solvedTicketsRouter);
 
 // --- HTTP + Socket.IO ---
 const server = http.createServer(app);
 const io = new SocketIOServer(server, { cors: { origin: "*" } });
 
-// --- In-memory ---
+// --- In-memory metrics ---
 let happiness = 100;
 const activateAgentTickets = new Map(); // ticketId -> last agent activity ms
 
 // ---------- AI context helpers ----------
-
-// very rough token estimate (~4 chars per token)
 function estimateTokens(str = "") {
-  return Math.ceil((str || "").length / 4);
+  return Math.ceil((str || "").length / 4); // coarse estimate
 }
 
-/** Fetch recent messages for a ticket (oldest->newest) */
 async function fetchRecentMessages(ticketId, limit = 50) {
   const msgs = await ChatMessage.find({
     ticketId: new mongoose.Types.ObjectId(String(ticketId)),
@@ -66,12 +65,6 @@ async function fetchRecentMessages(ticketId, limit = 50) {
   }));
 }
 
-/**
- * Build OpenAI chat "messages" with:
- * - system prompt
- * - brief ticket context (title/city/keywords/sentiment)
- * - trimmed conversation history (mapped to user/assistant)
- */
 function buildMessagesForOpenAI({
   systemPrompt,
   ticket,
@@ -86,9 +79,11 @@ function buildMessagesForOpenAI({
   const ctxParts = [];
   if (ticket?.title) ctxParts.push(`Issue: ${ticket.title}`);
   if (ticket?.city) ctxParts.push(`City: ${ticket.city}`);
-  if (Array.isArray(ticket?.keywords) && ticket.keywords.length)
-    ctxParts.push(`Keywords: ${ticket.keywords.join(", ")}`);
-  if (ticket?.sentiment) ctxParts.push(`Prev sentiment: ${ticket.sentiment}`);
+  if (Array.isArray(ticket?.aiKeywords) && ticket.aiKeywords.length)
+    ctxParts.push(`Keywords: ${ticket.aiKeywords.join(", ")}`);
+  if (ticket?.aiSentiment)
+    ctxParts.push(`Prev sentiment: ${ticket.aiSentiment}`);
+
   const contextBlock = ctxParts.length
     ? `Ticket context — ${ctxParts.join(" · ")}`
     : "Ticket context — (none)";
@@ -126,9 +121,7 @@ async function computeStats() {
     { $group: { _id: "$severity", count: { $sum: 1 } } },
   ]);
   const severityCounts = { minor: 0, major: 0, critical: 0 };
-  for (const row of bySeverity) {
-    severityCounts[row._id] = row.count || 0;
-  }
+  for (const row of bySeverity) severityCounts[row._id] = row.count || 0;
 
   const recentClosed = await Ticket.find({ status: "fixed" })
     .sort({ updatedAt: -1 })
@@ -185,8 +178,10 @@ function emitTicketMeta(ticket) {
     lastMessageAt: ticket.lastMessageAt,
     flagged: !!ticket.flagged,
     flaggedAt: ticket.flaggedAt || null,
-    sentiment: ticket.sentiment || "neutral",
-    keywords: Array.isArray(ticket.keywords) ? ticket.keywords : [],
+    // also broadcast AI fields for live dashboards
+    aiSentiment: ticket.aiSentiment || "neutral",
+    aiKeywords: Array.isArray(ticket.aiKeywords) ? ticket.aiKeywords : [],
+    aiSummary: ticket.aiSummary || "",
   });
 }
 
@@ -238,7 +233,7 @@ async function addMessage({
     activateAgentTickets.set(String(ticketId), Date.now());
   }
 
-  // AI trigger (user-only, quiet for 5m after agent message)
+  // AI trigger (user-only, quiet 5m after agent message)
   if (triggerAI && openai && authorType === "user") {
     const last = activateAgentTickets.get(String(ticketId));
     const quiet = !last || Date.now() - last >= 5 * 60 * 1000;
@@ -249,7 +244,7 @@ async function addMessage({
           const systemPrompt = `
 You are a T-Mobile customer support assistant.
 
-Respond ONLY in valid JSON with this shape:
+Respond ONLY in valid JSON with this exact shape:
 {
   "reply": "<concise professional answer>",
   "sentiment": "<neutral|upset|happy|confused>",
@@ -274,10 +269,10 @@ Rules:
   }
 `.trim();
 
-          // 1) Pull recent history for THIS ticket (oldest -> newest)
+          // 1) Load recent history
           const history = await fetchRecentMessages(ticketId, 50);
 
-          // 2) Build messages with system + concise ticket context + trimmed convo
+          // 2) Compose OpenAI messages with trimmed history
           const oaMessages = buildMessagesForOpenAI({
             systemPrompt,
             ticket,
@@ -286,7 +281,7 @@ Rules:
             responseTokens: 500,
           });
 
-          // 3) Ask model with full context
+          // 3) Call OpenAI
           const aiResp = await openai.chat.completions.create({
             model: "gpt-3.5-turbo",
             messages: oaMessages,
@@ -295,11 +290,11 @@ Rules:
           });
 
           const raw = aiResp?.choices?.[0]?.message?.content?.trim() || "";
-          let parsed;
+          let aiJson;
           try {
-            parsed = JSON.parse(raw);
+            aiJson = JSON.parse(raw);
           } catch {
-            parsed = {
+            aiJson = {
               reply: raw || "Thanks—let me check that for you.",
               sentiment: "neutral",
               flagged: false,
@@ -307,48 +302,76 @@ Rules:
             };
           }
 
-          // normalize + auto-flag if upset
-          const botText = (parsed.reply || "").toString().slice(0, 4000);
-          const sentiment = (parsed.sentiment || "neutral").toString();
-          let flagged = Boolean(parsed.flagged);
-          const keywords = Array.isArray(parsed.keywords)
-            ? parsed.keywords
+          // Normalize + safety
+          const botText = (aiJson.reply || "").toString().slice(0, 4000);
+          const aiSentiment = (aiJson.sentiment || "neutral").toString();
+          let flagged = Boolean(aiJson.flagged);
+          const aiKeywords = Array.isArray(aiJson.keywords)
+            ? aiJson.keywords
             : [];
-          if (sentiment.toLowerCase() === "upset") flagged = true;
+          if (aiSentiment.toLowerCase() === "upset") flagged = true;
 
-          // Post bot message
-          await addMessage({
-            ticketId,
+          // 4) Send bot message (broadcasts via chat:new)
+          await ChatMessage.create({
+            ticketId: new mongoose.Types.ObjectId(String(ticketId)),
             authorType: "bot",
             authorName: "AutoBot",
             text: botText,
-            triggerAI: false, // don't recurse
           });
+          const botPayload = {
+            _id: new mongoose.Types.ObjectId(),
+            ticketId: String(ticketId),
+            authorType: "bot",
+            authorName: "AutoBot",
+            text: botText,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+          io.to(`ticket:${String(ticketId)}`).emit("chat:new", botPayload);
+          io.to("support").emit("chat:new", botPayload);
 
-          // Persist AI analysis on ticket
-          try {
-            ticket.sentiment = sentiment;
-            ticket.keywords = keywords;
-            ticket.analyzedAt = new Date();
-            if (flagged) {
-              ticket.flagged = true;
-              ticket.flaggedAt = new Date();
-            }
-            await ticket.save();
+          // 5) Update ticket meta count/snippet + save AI fields
+          ticket.lastMessageAt = new Date();
+          ticket.lastMessageSnippet = botText.slice(0, 120);
+          ticket.messageCount = (ticket.messageCount || 0) + 1;
 
-            // real-time meta (includes flag fields) + staff toast
-            emitTicketMeta(ticket);
-            if (flagged) {
-              io.to("support").emit("ticket:flagged", {
-                ticketId: String(ticketId),
-                sentiment,
-                flagged: true,
-                keywords,
-                flaggedAt: ticket.flaggedAt,
-              });
-            }
-          } catch (e) {
-            console.error("Ticket save (analysis) error:", e?.message || e);
+          // ✅ Save AI fields for "Last Solved Issues" + dashboards
+          ticket.aiSummary = botText.slice(0, 400);
+          ticket.aiSentiment = aiSentiment;
+          ticket.aiKeywords = aiKeywords;
+
+          // Also keep analysis/flag used elsewhere
+          ticket.sentiment = aiSentiment;
+          ticket.keywords = aiKeywords;
+          ticket.analyzedAt = new Date();
+
+          if (flagged) {
+            ticket.flagged = true;
+            ticket.flaggedAt = new Date();
+          }
+
+          await ticket.save();
+
+          // 6) Real-time updates for dashboards (no refresh needed)
+          emitTicketMeta(ticket);
+          io.emit("ticket:updated", {
+            id: String(ticket._id),
+            aiSentiment: ticket.aiSentiment,
+            aiScore: sentimentScore(ticket.aiSentiment),
+            aiKeywords: ticket.aiKeywords,
+            aiSummary: ticket.aiSummary,
+            lastMessageSnippet: ticket.lastMessageSnippet,
+            messageCount: ticket.messageCount,
+            flagged: ticket.flagged,
+          });
+          if (flagged) {
+            io.to("support").emit("ticket:flagged", {
+              ticketId: String(ticketId),
+              sentiment: ticket.aiSentiment,
+              flagged: true,
+              keywords: ticket.aiKeywords,
+              flaggedAt: ticket.flaggedAt,
+            });
           }
         } catch (e) {
           console.error("OpenAI reply error:", e?.message || e);
@@ -358,6 +381,21 @@ Rules:
   }
 
   return payload;
+}
+
+// Helper for aiScore here (mirrors model static)
+function sentimentScore(s) {
+  switch (String(s || "").toLowerCase()) {
+    case "happy":
+      return 5;
+    case "upset":
+      return -5;
+    case "confused":
+      return -2;
+    case "neutral":
+    default:
+      return 0;
+  }
 }
 
 // ---------- REST: test ticket ----------
@@ -511,7 +549,7 @@ app.get("/api/tickets/:id/messages", async (req, res) => {
   }
 });
 
-// ---------- REST: toggle flag (real-time broadcast) ----------
+// ---------- REST: toggle flag ----------
 app.patch("/api/tickets/:id/flag", async (req, res) => {
   try {
     const id = String(req.params.id || "");
@@ -593,7 +631,7 @@ app.get("/", (_req, res) => {
   res.send("Server is running ✅");
 });
 
-// ---------- Socket.IO connection: send backlog on join ----------
+// ---------- Socket.IO connection ----------
 io.on("connection", async (socket) => {
   console.log(`🟢 Client connected: ${socket.id}`);
   socket.emit("happiness:update", { happiness });
@@ -614,7 +652,7 @@ io.on("connection", async (socket) => {
         socket.emit("joined", { room });
         console.log(`🧵 ${socket.id} joined room: ${room}`);
 
-        // Send backlog immediately so client never misses AI replies
+        // backlog so client never misses AI reply
         const msgs = await ChatMessage.find({
           ticketId: new mongoose.Types.ObjectId(String(ticketId)),
         })

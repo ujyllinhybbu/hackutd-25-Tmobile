@@ -1,49 +1,89 @@
-// models/Ticket.js
+// server/models/Ticket.js
 import mongoose from "mongoose";
+
+const sentimentScore = (s) => {
+  switch (String(s || "").toLowerCase()) {
+    case "happy":
+      return 5;
+    case "upset":
+      return -5;
+    case "confused":
+      return -2;
+    case "neutral":
+    default:
+      return 0;
+  }
+};
 
 const TicketSchema = new mongoose.Schema(
   {
-    title: { type: String, required: true },
-    description: { type: String, default: "" },
-    city: { type: String, default: "Unknown" },
-
+    title: { type: String, trim: true },
+    description: { type: String, trim: true },
+    city: { type: String, trim: true },
     severity: {
       type: String,
       enum: ["minor", "major", "critical"],
       default: "minor",
+      index: true,
     },
     status: {
       type: String,
       enum: ["open", "fixed"],
       default: "open",
+      index: true,
     },
+    createdBy: { type: String, trim: true },
 
-    createdBy: { type: String, default: "Guest" },
-
-    // denormalized chat meta
-    messageCount: { type: Number, default: 0 },
+    // denorm for dashboards
     lastMessageSnippet: { type: String, default: "" },
-    lastMessageAt: { type: Date, default: null },
-    closedAt: { type: Date, default: null },
+    lastMessageAt: { type: Date, index: true },
+    messageCount: { type: Number, default: 0 },
+    flagged: { type: Boolean, default: false, index: true },
 
-    // ---- AI analysis fields ----
-    flagged: { type: Boolean, default: false },
-    flaggedAt: { type: Date, default: null },
-    sentiment: {
+    // close info
+    closedAt: { type: Date, index: true },
+
+    // ✅ AI fields
+    aiSummary: { type: String, default: "" },
+    aiSentiment: {
       type: String,
       enum: ["neutral", "upset", "happy", "confused"],
       default: "neutral",
+      index: true,
     },
-    keywords: { type: [String], default: [] },
-    analyzedAt: { type: Date, default: null },
+    aiKeywords: {
+      type: [String],
+      default: [],
+      set: (arr) =>
+        Array.from(
+          new Set(
+            (arr || [])
+              .map((s) =>
+                String(s || "")
+                  .trim()
+                  .toLowerCase()
+              )
+              .filter(Boolean)
+          )
+        ),
+      index: true, // multikey for keyword filters
+    },
   },
-  { timestamps: true }
+  { timestamps: true, toJSON: { virtuals: true }, toObject: { virtuals: true } }
 );
 
-// Helpful indexes for dashboards/filters
-TicketSchema.index({ status: 1, severity: 1, updatedAt: -1 });
-TicketSchema.index({ flagged: 1, updatedAt: -1 });
-TicketSchema.index({ keywords: 1 });
+// ⚡ common query patterns
+TicketSchema.index({ status: 1, closedAt: -1 });
+TicketSchema.index({ status: 1, updatedAt: -1 });
+TicketSchema.index({ aiSentiment: 1, closedAt: -1 });
+TicketSchema.index({ city: 1, closedAt: -1 });
+// Optional text search:
+// TicketSchema.index({ title: "text", description: "text", aiSummary: "text" });
 
-const Ticket = mongoose.model("Ticket", TicketSchema);
-export default Ticket;
+// Virtual score
+TicketSchema.virtual("aiScore").get(function () {
+  return sentimentScore(this.aiSentiment);
+});
+TicketSchema.statics.sentimentScore = sentimentScore;
+
+export default mongoose.models.Ticket || mongoose.model("Ticket", TicketSchema);
