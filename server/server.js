@@ -14,8 +14,35 @@ import metricsRouter from "./metrics.js";
 import solvedTicketsRouter from "./routes/solved-tickets.js";
 import simpleMetricsRouter from "./routes/simple-metrics.js";
 import ihrRouter from "./routes/ihr.js";
+//import { text } from "body-parser";
 
 dotenv.config();
+
+function sentimentScore(hfResult) {
+  const scores = Object.fromEntries(hfResult[0].map(x => [x.label, x.score]));
+  return (
+    scores["Very Positive"] * 5 +
+    scores["Positive"]* 3 +
+    scores["Neutral"] * 0 +
+    scores["Negative"] * (-4) +
+    scores["Very Negative"] * (-5)
+  );
+};
+async function query(data) {
+	const response = await fetch(
+		"https://router.huggingface.co/hf-inference/models/tabularisai/multilingual-sentiment-analysis",
+		{
+			headers: {
+				Authorization: `Bearer ${process.env.HF_TOKEN}`,
+				"Content-Type": "application/json",
+			},
+			method: "POST",
+			body: JSON.stringify(data),
+		}
+	);
+	const result = await response.json();
+	return result;
+}
 
 // ---------------------------- Config ----------------------------
 const IHR_BASE = process.env.IHR_BASE || "https://www.ihr.live/ihr/api";
@@ -173,20 +200,6 @@ function buildMessagesForOpenAI({
     convo.push({ role: "user", content: "User started a new ticket." });
   }
   return messages.concat(convo);
-}
-
-function sentimentScore(s) {
-  switch (String(s || "").toLowerCase()) {
-    case "happy":
-      return 5;
-    case "upset":
-      return -5;
-    case "confused":
-      return -2;
-    case "neutral":
-    default:
-      return 0;
-  }
 }
 
 // ---------------------------- Stats helpers ----------------------------
@@ -568,7 +581,7 @@ app.post("/api/test-ticket", async (req, res) => {
     } = req.body || {};
     const ticket = await Ticket.create({ title, city, severity, status });
 
-    happiness = Math.max(0, happiness - 5);
+    happiness = Math.max(0, happiness + SS);
     io.emit("happiness:update", { happiness });
     io.emit("ticket:created", ticket);
     await computeAndEmitStats();
@@ -625,7 +638,7 @@ app.post("/api/tickets", async (req, res) => {
       triggerAI: true,
     });
 
-    happiness = Math.max(0, happiness - 5);
+    happiness = Math.max(0, happiness + SS);
     io.emit("happiness:update", { happiness });
     io.emit("ticket:created", ticket);
     await computeAndEmitStats();
@@ -636,7 +649,7 @@ app.post("/api/tickets", async (req, res) => {
     res.status(500).json({ success: false, error: err.message });
   }
 });
-
+let SS = null;
 // Append chat message
 app.post("/api/tickets/:id/chat", async (req, res) => {
   try {
@@ -647,6 +660,12 @@ app.post("/api/tickets/:id/chat", async (req, res) => {
       text = "",
     } = req.body || {};
 
+    const hfResult = await query({ inputs: text });
+    SS = sentimentScore(hfResult);
+    query({ inputs: text }).then((response) => {
+        console.log(JSON.stringify(response));
+        console.log("Sentiment score:", sentimentScore(response));
+    });
     if (!mongoose.Types.ObjectId.isValid(id)) {
       return res
         .status(400)
