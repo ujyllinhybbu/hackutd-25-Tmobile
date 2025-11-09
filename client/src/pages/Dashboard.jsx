@@ -1,18 +1,19 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import React, { useEffect, useMemo, useState } from "react";
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from "../components/ui/card";
+import { Button } from "../components/ui/button";
+import { Badge } from "../components/ui/badge";
+import { Alert, AlertDescription, AlertTitle } from "../components/ui/alert";
 import {
   Activity,
   AlertTriangle,
   Smile,
   Frown,
-  PhoneCall,
   Signal,
-  MapPin,
   RefreshCw,
 } from "lucide-react";
 import {
@@ -23,9 +24,6 @@ import {
   Tooltip,
   ResponsiveContainer,
   CartesianGrid,
-  PieChart,
-  Pie,
-  Cell,
   BarChart,
   Bar,
   Legend,
@@ -38,7 +36,6 @@ const REGIONS = [
   "Houston",
   "Chicago",
 ];
-
 const TOPICS = ["billing", "network", "device", "account", "care"];
 const TOPIC_LABEL = {
   billing: "Billing",
@@ -65,11 +62,9 @@ function formatClock(ts) {
   });
 }
 
-// generate a customer utterance with topic + sentiment
 function genCustomerTurn(prevHI) {
   const topic = TOPICS[Math.floor(Math.random() * TOPICS.length)];
   const region = REGIONS[Math.floor(Math.random() * REGIONS.length)];
-  // sentiment baseline by topic
   const baseByTopic = {
     billing: [30, 60],
     network: [25, 55],
@@ -78,7 +73,6 @@ function genCustomerTurn(prevHI) {
     care: [35, 65],
   };
   const [lo, hi] = baseByTopic[topic];
-  // nudge based on previous HI (if low, keep lower sentiment)
   const nudge = prevHI < 60 ? -10 : prevHI > 80 ? 10 : 0;
   const customerSentiment = clamp01(rand(lo, hi) + nudge);
 
@@ -124,9 +118,7 @@ function genCustomerTurn(prevHI) {
   };
 }
 
-// generate an agent response w/ AQ and projected HI
-function genAgentTurn(customer, prevConfirmedHI) {
-  // Agent quality boosts more when customer sentiment is low
+function genAgentTurn(customer) {
   const empathy = customer.customerSentiment < 50 ? rand(75, 95) : rand(60, 85);
   const ownership = rand(65, 95);
   const nextStep = rand(70, 95);
@@ -134,16 +126,14 @@ function genAgentTurn(customer, prevConfirmedHI) {
   const agentQuality = clamp01(
     empathy * 0.45 + ownership * 0.25 + nextStep * 0.3 + latencyPenalty
   );
-
-  // Projected HI before next customer response
   const projectedHI = clamp01(
     0.7 * (customer.customerSentiment ?? 50) + 0.3 * agentQuality
   );
 
   const responseByTopic = {
     billing: [
-      "I'm sorry about the confusion—I'll review your charges right now and correct any errors.",
-      "Thanks for flagging this. I can itemize the bill and apply any necessary credits.",
+      "I'm sorry about the confusion—I'll review your charges and correct any errors.",
+      "Thanks for flagging this. I can itemize the bill and apply credits.",
     ],
     network: [
       "Sorry for the trouble. I'll check your area and optimize your line settings now.",
@@ -181,7 +171,6 @@ function genAgentTurn(customer, prevConfirmedHI) {
 }
 
 function computeConfirmedHI(turns) {
-  // Confirmed HI is computed after each customer turn based on latest CS and previous AQ
   const lastCustomer = [...turns].reverse().find((t) => t.role === "customer");
   const lastAgent = [...turns].reverse().find((t) => t.role === "agent");
   const cs = lastCustomer?.customerSentiment ?? 60;
@@ -189,24 +178,20 @@ function computeConfirmedHI(turns) {
   return clamp01(0.7 * cs + 0.3 * aq);
 }
 
-// -----------------------------
-// UI Components
-// -----------------------------
-
 function KPI({ label, value, sub, icon }) {
   return (
-    <Card className="rounded-2xl bg-white border border-rose-200 shadow-[0_10px_30px_rgba(226,0,116,0.08)]">
+    <Card className="flex flex-col justify-between rounded-2xl border border-white/20 bg-white/40 backdrop-blur-lg shadow-[0_8px_25px_rgba(226,0,116,0.25)]">
       <CardHeader className="flex flex-row items-center justify-between pb-2">
-        <CardTitle className="text-sm font-medium text-slate-500">
+        <CardTitle className="text-sm font-medium text-slate-800">
           {label}
         </CardTitle>
         {icon}
       </CardHeader>
       <CardContent>
-        <div className="text-4xl font-bold tracking-tight text-slate-900 drop-shadow">
+        <div className="text-3xl sm:text-4xl font-bold tracking-tight text-[#E20074] drop-shadow-sm">
           {value}
         </div>
-        {sub && <div className="text-xs text-slate-500 mt-1">{sub}</div>}
+        {sub && <div className="text-xs text-slate-600 mt-1">{sub}</div>}
       </CardContent>
     </Card>
   );
@@ -219,39 +204,31 @@ function TrendChart({ data }) {
     Projected: d.projected,
   }));
   return (
-    <Card className="rounded-2xl bg-white border border-rose-200 shadow-[0_10px_30px_rgba(226,0,116,0.08)]">
+    <Card className="rounded-2xl border border-white/20 bg-white/40 backdrop-blur-lg shadow-[0_8px_25px_rgba(226,0,116,0.25)]">
       <CardHeader className="pb-2">
-        <CardTitle>Happiness Index – Real‑time Trend</CardTitle>
+        <CardTitle>Happiness Index – Real-time Trend</CardTitle>
       </CardHeader>
       <CardContent>
-        <div className="h-64 w-full">
+        <div className="h-[300px] sm:h-[350px] md:h-[400px] w-full">
           <ResponsiveContainer>
             <LineChart data={formatted}>
-              <CartesianGrid strokeDasharray="3 3" stroke="rgba(0,0,0,0.08)" />
-              <XAxis
-                dataKey="time"
-                tick={{ fontSize: 12, fill: "rgba(0,0,0,0.7)" }}
-                stroke="rgba(0,0,0,0.2)"
-              />
-              <YAxis
-                domain={[0, 100]}
-                tick={{ fontSize: 12, fill: "rgba(0,0,0,0.7)" }}
-                stroke="rgba(0,0,0,0.2)"
-              />
+              <CartesianGrid strokeDasharray="3 3" stroke="rgba(0,0,0,0.1)" />
+              <XAxis dataKey="time" tick={{ fontSize: 12 }} />
+              <YAxis domain={[0, 100]} tick={{ fontSize: 12 }} />
               <Tooltip />
               <Legend />
               <Line
                 type="monotone"
                 dataKey="Confirmed"
                 dot={false}
-                strokeWidth={2}
+                strokeWidth={3}
                 stroke="#E20074"
               />
               <Line
                 type="monotone"
                 dataKey="Projected"
                 dot={false}
-                strokeWidth={2}
+                strokeWidth={3}
                 stroke="#FF9AD5"
               />
             </LineChart>
@@ -268,27 +245,19 @@ function TopicBar({ counts }) {
     count: v,
   }));
   return (
-    <Card className="rounded-2xl bg-white border border-rose-200 shadow-[0_10px_30px_rgba(226,0,116,0.08)]">
+    <Card className="rounded-2xl border border-white/20 bg-white/40 backdrop-blur-lg shadow-[0_8px_25px_rgba(226,0,116,0.25)]">
       <CardHeader className="pb-2">
         <CardTitle>Issues by Topic (last 15m)</CardTitle>
       </CardHeader>
       <CardContent>
-        <div className="h-64 w-full">
+        <div className="h-[300px] sm:h-[350px] md:h-[400px] w-full">
           <ResponsiveContainer>
             <BarChart data={data}>
-              <CartesianGrid strokeDasharray="3 3" stroke="rgba(0,0,0,0.08)" />
-              <XAxis
-                dataKey="topic"
-                tick={{ fontSize: 12, fill: "rgba(0,0,0,0.7)" }}
-                stroke="rgba(0,0,0,0.2)"
-              />
-              <YAxis
-                allowDecimals={false}
-                tick={{ fontSize: 12, fill: "rgba(0,0,0,0.7)" }}
-                stroke="rgba(0,0,0,0.2)"
-              />
+              <CartesianGrid strokeDasharray="3 3" stroke="rgba(0,0,0,0.1)" />
+              <XAxis dataKey="topic" tick={{ fontSize: 12 }} />
+              <YAxis allowDecimals={false} tick={{ fontSize: 12 }} />
               <Tooltip />
-              <Bar dataKey="count" fill="#E20074" />
+              <Bar dataKey="count" fill="#E20074" radius={[6, 6, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
         </div>
@@ -297,99 +266,33 @@ function TopicBar({ counts }) {
   );
 }
 
-function LiveFeed({ turns }) {
-  const last20 = turns.slice(-20).reverse();
-  return (
-    <Card className="rounded-2xl bg-white border border-rose-200 shadow-[0_10px_30px_rgba(226,0,116,0.08)]">
-      <CardHeader className="pb-2">
-        <CardTitle>Live Conversation Feed</CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        {last20.map((t) => (
-          <div
-            key={t.id}
-            className="grid grid-cols-12 gap-2 items-start border rounded-xl p-3"
-          >
-            <div className="col-span-2 flex items-center gap-2">
-              {t.role === "customer" ? (
-                <Badge className="text-xs bg-[#E20074] hover:bg-[#c60063] text-white">
-                  Customer
-                </Badge>
-              ) : (
-                <Badge variant="secondary" className="text-xs">
-                  Agent
-                </Badge>
-              )}
-              <Badge className="text-xs border border-rose-300 text-rose-800">
-                {TOPIC_LABEL[t.topic]}
-              </Badge>
-            </div>
-            <div className="col-span-7">
-              <div className="text-sm">{t.text}</div>
-              <div className="text-[10px] text-slate-500 mt-1">
-                {formatClock(t.ts)} • {t.region}
-              </div>
-            </div>
-            <div className="col-span-3 text-right space-y-1">
-              {t.role === "customer" && (
-                <Badge
-                  className="text-xs"
-                  variant={
-                    t.customerSentiment >= 70
-                      ? "default"
-                      : t.customerSentiment >= 50
-                      ? "secondary"
-                      : "destructive"
-                  }
-                >
-                  CS {Math.round(t.customerSentiment)}
-                </Badge>
-              )}
-              {t.role === "agent" && (
-                <>
-                  <Badge
-                    className="text-xs"
-                    variant={t.agentQuality >= 80 ? "default" : "secondary"}
-                  >
-                    AQ {Math.round(t.agentQuality)}
-                  </Badge>
-                  <Badge className="text-xs" variant="outline">
-                    Projected {Math.round(t.projectedHI)}
-                  </Badge>
-                </>
-              )}
-            </div>
-          </div>
-        ))}
-      </CardContent>
-    </Card>
-  );
-}
-
 function Alerts({ series }) {
   const latest = series.at(-1);
-  const prev = series.at(-6); // ~ last 6 points window
+  const prev = series.at(-6);
   const drop =
     latest && prev ? Math.round(prev.confirmed - latest.confirmed) : 0;
   const showAlert = latest && drop >= 15;
   if (!latest) return null;
   return (
-    <Card className="rounded-2xl bg-white border border-rose-200 shadow-[0_10px_30px_rgba(226,0,116,0.08)]">
+    <Card className="rounded-2xl border border-white/20 bg-white/40 backdrop-blur-lg shadow-[0_8px_25px_rgba(226,0,116,0.25)]">
       <CardHeader className="pb-2">
         <CardTitle>Early Warning</CardTitle>
       </CardHeader>
       <CardContent>
         {showAlert ? (
-          <Alert variant="destructive" className="rounded-xl">
+          <Alert
+            variant="destructive"
+            className="rounded-xl bg-[#E20074]/20 text-[#E20074] border-[#E20074]/40 backdrop-blur-md"
+          >
             <AlertTriangle className="h-4 w-4" />
             <AlertTitle>Sentiment Drop Detected</AlertTitle>
             <AlertDescription>
-              Happiness Index dropped by {drop} points in the last window.
-              Investigate recent conversations and common topics.
+              Happiness Index dropped by {drop} points recently. Investigate
+              common topics.
             </AlertDescription>
           </Alert>
         ) : (
-          <Alert className="rounded-xl">
+          <Alert className="rounded-xl bg-white/50 backdrop-blur-md border-white/20 text-slate-800">
             <Smile className="h-4 w-4" />
             <AlertTitle>Stable</AlertTitle>
             <AlertDescription>
@@ -402,47 +305,32 @@ function Alerts({ series }) {
   );
 }
 
-// -----------------------------
-// Main Component
-// -----------------------------
-
 export default function DashboardDemo() {
   const [turns, setTurns] = useState([]);
   const [series, setSeries] = useState([]);
   const [regionFilter, setRegionFilter] = useState("All Regions");
   const [running, setRunning] = useState(true);
 
-  // seed
   useEffect(() => {
     if (turns.length === 0) {
-      // 1) first customer speaks → compute Confirmed HI
       const seedCust = genCustomerTurn(70);
       const confirmed = computeConfirmedHI([seedCust]);
-      // 2) agent responds → compute Projected HI
       const seedAgent = genAgentTurn(seedCust, confirmed);
       const projected = seedAgent.projectedHI ?? confirmed;
-
       setTurns([seedCust, seedAgent]);
       setSeries([{ ts: Date.now(), confirmed, projected }]);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // generator loop
   useEffect(() => {
     if (!running) return;
     const iv = setInterval(() => {
       setTurns((prev) => {
         const lastConfirmed = series.at(-1)?.confirmed ?? 70;
-
-        // 1) Customer speaks → update Confirmed HI
         const cust = genCustomerTurn(lastConfirmed);
         const confirmed = computeConfirmedHI([...prev, cust]);
-
-        // 2) Agent responds → update Projected HI
         const agent = genAgentTurn(cust, confirmed);
         const projected = agent.projectedHI ?? confirmed;
-
         const next = [...prev, cust, agent];
         setSeries((s) => [
           ...s.slice(-49),
@@ -461,48 +349,34 @@ export default function DashboardDemo() {
 
   const latestConfirmed = series.at(-1)?.confirmed ?? 70;
   const latestProjected = series.at(-1)?.projected ?? latestConfirmed;
-
-  const topicCounts = {
-    billing: 0,
-    network: 0,
-    device: 0,
-    account: 0,
-    care: 0,
-  };
+  const topicCounts = Object.fromEntries(TOPICS.map((t) => [t, 0]));
   filteredTurns.forEach((t) => {
     if (t.role === "customer") topicCounts[t.topic] += 1;
   });
 
-  const csLatest = (() => {
-    const lastCust = [...filteredTurns]
-      .reverse()
-      .find((t) => t.role === "customer");
-    return lastCust?.customerSentiment ?? 65;
-  })();
-
-  const aqLatest = (() => {
-    const lastAgent = [...filteredTurns]
-      .reverse()
-      .find((t) => t.role === "agent");
-    return lastAgent?.agentQuality ?? 78;
-  })();
+  const csLatest =
+    [...filteredTurns].reverse().find((t) => t.role === "customer")
+      ?.customerSentiment ?? 65;
+  const aqLatest =
+    [...filteredTurns].reverse().find((t) => t.role === "agent")
+      ?.agentQuality ?? 78;
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-white via-rose-50 to-white text-slate-900 p-6 md:p-10 space-y-6 max-w-7xl mx-auto">
+    <div className="min-h-screen flex flex-col bg-gradient-to-br from-[#E20074]/10 via-white/60 to-[#FFB7E6]/30 text-slate-900 px-4 sm:px-6 md:px-10 py-6 space-y-6 w-full overflow-x-hidden backdrop-blur-3xl">
       {/* Header */}
       <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
         <div>
-          <h1 className="text-2xl md:text-3xl font-bold tracking-tight bg-gradient-to-r from-[#E20074] to-[#FF77C8] bg-clip-text text-transparent">
-            Chatbot Happiness Dashboard
+          <h1 className="text-2xl md:text-3xl font-bold tracking-tight bg-gradient-to-r from-[#E20074] to-[#FF77C8] bg-clip-text text-transparent drop-shadow-sm">
+            T-Mobile AI Dashboard
           </h1>
-          <p className="text-slate-600">
-            Real‑time customer sentiment from chatbot conversations (Projected
-            vs Confirmed).
+          <p className="text-slate-700 text-sm md:text-base">
+            Real-time sentiment and agent performance — rendered in Apple-style
+            glass UI.
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <select
-            className="border border-rose-300 bg-white text-slate-900 rounded-xl h-10 px-3 text-sm focus:outline-none focus:ring-2 focus:ring-[#E20074]/60"
+            className="border border-white/40 bg-white/40 backdrop-blur-md text-slate-900 rounded-xl h-10 px-3 text-sm focus:ring-2 focus:ring-[#E20074]/40"
             value={regionFilter}
             onChange={(e) => setRegionFilter(e.target.value)}
           >
@@ -512,7 +386,7 @@ export default function DashboardDemo() {
             ))}
           </select>
           <Button
-            className="rounded-xl bg-[#E20074] hover:bg-[#c60063] text-white border-0"
+            className="rounded-xl bg-[#E20074] hover:bg-[#c60063] text-white border-0 shadow-[0_4px_20px_rgba(226,0,116,0.4)]"
             onClick={() => setRunning((r) => !r)}
           >
             <RefreshCw className="h-4 w-4 mr-2" />{" "}
@@ -522,36 +396,36 @@ export default function DashboardDemo() {
       </div>
 
       {/* KPIs */}
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 sm:grid-cols-2 md:grid-cols-4 gap-4">
         <KPI
           label="Happiness Index"
           value={`${Math.round(latestConfirmed)}`}
           sub="Confirmed"
-          icon={<Activity className="h-4 w-4 text-muted-foreground" />}
+          icon={<Activity />}
         />
         <KPI
           label="Projected HI"
           value={`${Math.round(latestProjected)}`}
-          sub="After last agent response"
-          icon={<Signal className="h-4 w-4 text-muted-foreground" />}
+          sub="After last agent"
+          icon={<Signal />}
         />
         <KPI
           label="Customer Sentiment"
           value={`${Math.round(csLatest)}`}
-          sub="Latest customer turn"
-          icon={<Frown className="h-4 w-4 text-muted-foreground" />}
+          sub="Latest customer"
+          icon={<Frown />}
         />
         <KPI
           label="Agent Quality"
           value={`${Math.round(aqLatest)}`}
-          sub="Latest agent turn"
-          icon={<Smile className="h-4 w-4 text-muted-foreground" />}
+          sub="Latest agent"
+          icon={<Smile />}
         />
       </div>
 
       {/* Charts */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <div className="lg:col-span-2">
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+        <div className="xl:col-span-2">
           <TrendChart data={series} />
         </div>
         <TopicBar counts={topicCounts} />
@@ -560,13 +434,6 @@ export default function DashboardDemo() {
       {/* Alerts + Feed */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <Alerts series={series} />
-        <LiveFeed turns={filteredTurns} />
-      </div>
-
-      {/* Footer Note */}
-      <div className="text-xs text-slate-500 text-center pt-2">
-        * Projected HI updates right after an agent response. Confirmed HI
-        updates after the next customer turn.
       </div>
     </div>
   );

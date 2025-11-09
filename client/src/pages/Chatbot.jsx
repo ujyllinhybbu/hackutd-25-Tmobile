@@ -22,16 +22,19 @@ function Chatbot() {
   return (
     <div
       style={{
-        maxWidth: 400,
-        margin: "40px auto",
-        border: "1px solid #ccc",
-        borderRadius: 8,
-        padding: 16,
+        width: "100vw",
+        height: "100vh",
+        display: "flex",
+        flexDirection: "column",
+        justifyContent: "center",
+        alignItems: "center",
         background: "#fafafa",
       }}
     >
       <h2>Chatbot</h2>
-      <div style={{ minHeight: 180, marginBottom: 12, overflowY: "auto" }}>
+      <div
+        style={{ width: "100%", flex: 1, marginBottom: 12, overflowY: "auto" }}
+      >
         {messages.map((msg, i) => (
           <div
             key={i}
@@ -44,7 +47,7 @@ function Chatbot() {
           </div>
         ))}
       </div>
-      <div style={{ display: "flex", gap: 8 }}>
+      <div style={{ display: "flex", gap: 8, width: "100%", maxWidth: 600 }}>
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
