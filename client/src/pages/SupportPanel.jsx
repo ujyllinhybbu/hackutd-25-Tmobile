@@ -1,6 +1,7 @@
 import React, { useMemo, useRef, useState, useEffect } from "react";
 import useSupportPanel from "../hooks/useSupportPanel";
 import {
+  Flag,
   Search,
   MessageSquare,
   Send,
@@ -8,7 +9,6 @@ import {
   Clock,
   MapPin,
   ChevronLeft,
-  Pencil,
   Wand2,
   X,
 } from "lucide-react";
@@ -68,7 +68,7 @@ function AnalysisModal({ open, onClose, summary }) {
           </div>
           <button
             onClick={onClose}
-            className="rounded-lg p-1 hover:bg-black/5"
+            className="rounded-lg p-1 hover:bg:black/5"
             aria-label="Close"
           >
             <X className="h-4 w-4" />
@@ -127,7 +127,7 @@ function AnalysisModal({ open, onClose, summary }) {
           >
             <div className="text-[11px] text-slate-500 mb-1">Signals</div>
             <ul className="list-disc pl-5 space-y-1">
-              {summary.signals.map((s, i) => (
+              {summary.signals?.map((s, i) => (
                 <li key={i}>{s}</li>
               ))}
             </ul>
@@ -164,17 +164,19 @@ function AnalysisModal({ open, onClose, summary }) {
   );
 }
 
-/* ---------- Ticket Row (with Analyze buttons) ---------- */
-function TicketRow({ t, active, onClick, onAnalyze, analyzing }) {
+/* ---------- Ticket Row (with Analyze + Flag) ---------- */
+function TicketRow({ t, active, onClick, onAnalyze, onFlag, analyzing }) {
   const isOpen = t.status !== "fixed";
+  const flagged = !!t.flagged;
+
   return (
     <motion.button
       onClick={onClick}
       layout
       initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
-      whileHover={{ scale: 1.005 }}
-      whileTap={{ scale: 0.995 }}
+      whileHover={{ scale: 1 }}
+      whileTap={{ scale: 1 }}
       transition={{ type: "spring", stiffness: 320, damping: 24 }}
       className="w-full text-left relative rounded-2xl border p-3 mb-3"
       style={{
@@ -194,11 +196,7 @@ function TicketRow({ t, active, onClick, onAnalyze, analyzing }) {
         }}
         transition={{ type: "spring", stiffness: 400, damping: 30 }}
         className="absolute left-0 top-0 w-1.5 rounded-l-2xl"
-        style={{
-          background: `linear-gradient(${active ? 180 : 0}deg, ${T.magenta}, ${
-            T.magentaLight
-          })`,
-        }}
+        style={{}}
       />
 
       <div className="flex items-center justify-between gap-2">
@@ -227,44 +225,48 @@ function TicketRow({ t, active, onClick, onAnalyze, analyzing }) {
           )}
         </div>
 
-        {/* Right controls: status/severity + actions */}
+        {/* Right controls */}
         <div className="flex items-center gap-2 shrink-0">
           <Pill active={!isOpen}>{isOpen ? "Open" : "Fixed"}</Pill>
           <Pill>{t.severity || "minor"}</Pill>
 
-          {/* Inline action buttons – stop propagation so row isn’t selected */}
-          <div className="flex items-center gap-1 ml-1">
+          {/* Only show when flagged */}
+          {flagged && (
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                // optional: future “edit ticket” panel
-                console.log("Edit ticket", t._id);
+                onFlag?.(t); // typically toggles to false
               }}
-              title="Edit"
-              className="rounded-lg p-1.5 border hover:brightness-95"
-              style={{ borderColor: T.stroke, background: "white" }}
-            >
-              <Pencil className="h-4 w-4" />
-            </button>
-
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onAnalyze?.(t);
-              }}
-              title="AI Analyze"
-              className="rounded-lg p-1.5 border hover:brightness-95 inline-flex items-center gap-1"
+              title="Flagged"
+              className="rounded-lg px-2 py-1.5 border inline-flex items-center justify-center"
               style={{
-                borderColor: analyzing ? T.magenta : T.stroke,
-                background: analyzing ? "rgba(226,0,116,0.08)" : "white",
-                color: analyzing ? T.magenta : "inherit",
+                background: "#ef4444", // Tailwind red-500
+                borderColor: "rgba(0,0,0,0.05)",
+                color: "white",
               }}
-              disabled={analyzing}
             >
-              <Wand2 className="h-4 w-4" />
-              <span className="sr-only">Analyze</span>
+              <Flag className="h-4 w-4" />
             </button>
-          </div>
+          )}
+
+          {/* AI analyze */}
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onAnalyze?.(t);
+            }}
+            title="AI Analyze"
+            className="rounded-lg p-1.5 border hover:brightness-95 inline-flex items-center gap-1"
+            style={{
+              borderColor: analyzing ? T.magenta : T.stroke,
+              background: analyzing ? "rgba(226,0,116,0.08)" : "white",
+              color: analyzing ? T.magenta : "inherit",
+            }}
+            disabled={analyzing}
+          >
+            <Wand2 className="h-4 w-4" />
+            <span className="sr-only">Analyze</span>
+          </button>
         </div>
       </div>
     </motion.button>
@@ -327,7 +329,7 @@ export default function Support() {
     loading,
     loadingThread,
     error,
-    // optional: you can expose getMessages in the hook, but we’ll fetch here
+    // optional: expose getMessages in the hook, but we’ll fetch here
   } = useSupportPanel({
     apiBase: "/api",
     socketOrigin: "", // set "http://localhost:4000" if needed
@@ -462,6 +464,26 @@ export default function Support() {
     }
   };
 
+  /* ---------- Flag ticket (optimistic) ---------- */
+  const flagTicket = async (ticket) => {
+    const id = ticket._id;
+    try {
+      // optimistic UI: update local list if your hook exposes a setter;
+      // otherwise just call the API.
+      const res = await fetch(`/api/tickets/${id}/flag`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ flagged: !ticket.flagged }),
+      });
+      if (!res.ok) {
+        console.warn("Flag route missing or failed");
+      }
+      // Your hook likely receives socket "ticket:meta" updates and will refresh the row
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
   return (
     <div
       className="min-h-screen"
@@ -484,26 +506,6 @@ export default function Support() {
             <ChevronLeft className="h-4 w-4" />
             Dashboard
           </a>
-          <div className="text-center">
-            <div
-              className="inline-flex items-center gap-2 px-2.5 py-1 rounded-full text-xs font-semibold"
-              style={{ background: "rgba(226,0,116,0.12)", color: T.magenta }}
-            >
-              <MessageSquare className="h-3.5 w-3.5" />
-              Support Panel
-            </div>
-            <h1
-              className="mt-1 text-lg sm:text-xl font-extrabold tracking-tight"
-              style={{
-                backgroundImage: `linear-gradient(90deg, ${T.magenta}, ${T.magentaLight})`,
-                WebkitBackgroundClip: "text",
-                color: "transparent",
-              }}
-            >
-              Live Tickets & Conversations
-            </h1>
-          </div>
-          <div />
         </div>
       </header>
 
@@ -596,6 +598,7 @@ export default function Support() {
                     active={String(t._id) === String(selectedId)}
                     onClick={() => selectTicket(String(t._id))}
                     onAnalyze={analyzeTicket}
+                    onFlag={flagTicket}
                     analyzing={analyzingId === t._id}
                   />
                 </motion.div>
@@ -698,8 +701,11 @@ export default function Support() {
           {/* Composer */}
           <div className="pt-2 border-t" style={{ borderColor: T.stroke }}>
             <div
-              className="flex items-end gap-2 rounded-2xl border p-2 sm:p-3 bg-white/85"
-              style={{ borderColor: T.stroke }}
+              className="flex items-end gap-2 rounded-2xl border p-2 sm:p-3 bg:white/85"
+              style={{
+                borderColor: T.stroke,
+                background: "rgba(255,255,255,0.85)",
+              }}
             >
               <textarea
                 rows={1}
