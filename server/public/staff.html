@@ -2,13 +2,13 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>Staff Console</title>
+    <title>Support Console</title>
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <style>
       body {
         margin: 0;
         font-family: system-ui, sans-serif;
-        background: #0b1225;
+        background: #0f172a;
         color: #e5e7eb;
       }
       .wrap {
@@ -16,108 +16,115 @@
         margin: 24px auto;
         padding: 0 16px;
         display: grid;
-        grid-template-columns: 340px 1fr;
+        grid-template-columns: 320px 1fr;
         gap: 16px;
       }
-      .card {
-        background: #0f172a;
+      .col {
+        background: #0b1225;
         border: 1px solid #1e293b;
-        border-radius: 12px;
+        border-radius: 14px;
         padding: 12px;
       }
-      h1 {
-        margin: 16px;
+      h2 {
+        margin: 0 0 12px;
+        font-size: 18px;
       }
       .list {
-        max-height: 70vh;
-        overflow-y: auto;
+        height: 540px;
+        overflow: auto;
       }
-      .ticket {
-        padding: 10px;
-        border-radius: 8px;
+      .row {
         border: 1px solid #1e293b;
+        border-radius: 10px;
+        padding: 10px;
         margin-bottom: 8px;
         cursor: pointer;
+        background: #0a1122;
       }
-      .ticket:hover {
-        background: #0a1222;
-      }
-      .pill {
-        font-size: 12px;
-        border: 1px solid #334155;
-        padding: 2px 6px;
-        border-radius: 999px;
+      .row.active {
+        outline: 2px solid #2563eb;
       }
       .muted {
-        color: #9ca3af;
+        color: #94a3b8;
         font-size: 12px;
       }
+      .count {
+        font-size: 12px;
+        background: #0a1122;
+        border: 1px solid #1e293b;
+        padding: 2px 8px;
+        border-radius: 999px;
+        margin-left: 6px;
+      }
       .msgs {
-        height: 60vh;
+        height: 420px;
         overflow-y: auto;
         border: 1px solid #1e293b;
-        border-radius: 8px;
-        padding: 10px;
         background: #09122a;
+        border-radius: 12px;
+        padding: 12px;
       }
       .msg {
         margin: 8px 0;
       }
-      .meta {
-        color: #9ca3af;
-        font-size: 12px;
-      }
-      .agent {
-        color: #4ade80;
-      }
       .user {
         color: #f472b6;
+      }
+      .staff {
+        color: #4ade80;
       }
       .bot {
         color: #a78bfa;
       }
-      .row {
+      .meta {
+        color: #94a3b8;
+        font-size: 12px;
+      }
+      .flex {
         display: flex;
-        gap: 8px;
-        margin-top: 8px;
+        gap: 10px;
+        margin-top: 10px;
       }
       input,
       button {
-        padding: 10px;
-        border-radius: 8px;
-        border: 1px solid #334155;
+        padding: 10px 12px;
+        border-radius: 10px;
+        border: 1px solid #1e293b;
         background: #0a1122;
         color: #e5e7eb;
       }
+      input.grow {
+        flex: 1;
+      }
       button {
         background: #2563eb;
-        border: none;
+        border: 0;
         cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
       }
     </style>
   </head>
   <body>
-    <h1 style="text-align: center">🛠️ Staff Console</h1>
     <div class="wrap">
-      <div class="card">
-        <h3>Open Tickets</h3>
-        <div id="ticketList" class="list"></div>
+      <div class="col">
+        <h2>Tickets</h2>
+        <div class="list" id="ticketList"></div>
       </div>
-
-      <div class="card">
-        <div>
-          <strong id="currentTicket">No ticket selected</strong>
-          <span class="pill" id="statusPill"></span>
-        </div>
-        <div id="msgs" class="msgs" style="margin-top: 8px"></div>
-        <div class="row">
+      <div class="col">
+        <h2 id="threadTitle">Thread</h2>
+        <div class="msgs" id="msgs"></div>
+        <div class="flex">
+          <input id="agentName" placeholder="Agent name" style="width: 160px" />
           <input
-            id="reply"
-            placeholder="Type reply as agent…"
-            style="flex: 1"
+            id="chatInput"
+            placeholder="Type a message…"
+            class="grow"
+            disabled
           />
-          <button id="send">Send</button>
-          <button id="close">Close</button>
+          <button id="sendBtn" disabled>Send</button>
         </div>
       </div>
     </div>
@@ -127,67 +134,76 @@
       const $ = (id) => document.getElementById(id);
       const ticketList = $("ticketList");
       const msgs = $("msgs");
-      const statusPill = $("statusPill");
-      const currentTicketEl = $("currentTicket");
-      const replyInput = $("reply");
+      const sendBtn = $("sendBtn");
+      const chatInput = $("chatInput");
+      const agentNameInput = $("agentName");
+      const threadTitle = $("threadTitle");
 
-      let socket = io();
-      socket.on("connect", () => socket.emit("join", { role: "staff" }));
-
-      let tickets = [];
+      let socket;
       let activeTicketId = null;
 
-      async function loadTickets() {
-        const res = await fetch("/api/tickets");
-        tickets = await res.json();
-        renderTickets();
-      }
+      // Keep a short-lived buffer of our own sends so we can ignore the echoed chat:new
+      const recentSelfSends = []; // items: {text, authorName, at}
 
-      function renderTickets() {
-        ticketList.innerHTML = "";
-        tickets.forEach((t) => {
-          const div = document.createElement("div");
-          div.className = "ticket";
-          div.onclick = () => selectTicket(t._id);
-          const snippet = escapeHtml(t.lastMessageSnippet || "");
-          const when = t.lastMessageAt
-            ? new Date(t.lastMessageAt).toLocaleTimeString()
-            : "";
-          div.innerHTML = `
-          <div><strong>${escapeHtml(t.title)}</strong></div>
-          <div class="muted">${escapeHtml(t.city)} • severity: ${
-            t.severity
-          } • msgs: ${t.messageCount || 0}</div>
-          <div class="muted">${snippet} ${when ? "• " + when : ""}</div>
-          <div><span class="pill">${t.status}</span></div>`;
-          ticketList.appendChild(div);
+      function el(tag, attrs = {}, children = []) {
+        const n = document.createElement(tag);
+        Object.entries(attrs).forEach(([k, v]) => {
+          if (k === "class") n.className = v;
+          else if (k === "dataset")
+            Object.entries(v).forEach(([dk, dv]) => (n.dataset[dk] = dv));
+          else n.setAttribute(k, v);
         });
+        children.forEach((c) =>
+          typeof c === "string" ? (n.textContent = c) : n.appendChild(c)
+        );
+        return n;
+      }
+      function formatTime(d) {
+        return new Date(d).toLocaleTimeString();
       }
 
-      async function selectTicket(id) {
-        activeTicketId = id;
-        const t = tickets.find((x) => String(x._id) === String(id));
-        currentTicketEl.textContent = `Ticket: ${t?.title || id}`;
-        statusPill.textContent = `Status: ${t?.status || "open"}`;
-        msgs.innerHTML = "";
-
-        socket.emit("join", { ticketId: id });
-
-        const res = await fetch(`/api/tickets/${id}/chat`);
-        const data = await res.json();
-        (data.messages || []).forEach(addMsg);
+      function rowForTicket(t) {
+        const title = el("div", {}, [t.title || "(no title)"]);
+        const muted1 = el("div", { class: "muted" }, [
+          `${t.city || "Unknown"} • ${t.severity || "minor"} • ${t.status}`,
+        ]);
+        const snip = el("div", { class: "muted" }, [
+          (t.lastMessageSnippet || "").slice(0, 100),
+        ]);
+        const count = el("span", { class: "count" }, [
+          String(t.messageCount || 0),
+        ]);
+        const wrap = el("div", { class: "row", dataset: { ticketId: t._id } }, [
+          title,
+          muted1,
+          snip,
+          count,
+        ]);
+        wrap.onclick = () => openThread(t._id, t.title || "(no title)");
+        return wrap;
       }
 
-      function addMsg(m) {
-        const d = document.createElement("div");
-        const ts = new Date(m.createdAt).toLocaleTimeString();
-        d.className = `msg ${m.authorType}`;
-        d.innerHTML = `<div><strong>[${m.authorType}] ${escapeHtml(
-          m.authorName || ""
-        )}</strong> <span class="meta">${ts}</span></div><div>${escapeHtml(
-          m.text
-        )}</div>`;
-        msgs.appendChild(d);
+      function paintTickets(list) {
+        ticketList.innerHTML = "";
+        list.forEach((t) => ticketList.appendChild(rowForTicket(t)));
+      }
+
+      function selectActiveRow(id) {
+        for (const r of ticketList.querySelectorAll(".row")) {
+          r.classList.toggle("active", r.dataset.ticketId === id);
+        }
+      }
+
+      function addMsg({ authorType, authorName, text, createdAt }) {
+        const div = document.createElement("div");
+        const roleClass = authorType || "user";
+        div.className = `msg ${roleClass}`;
+        div.innerHTML = `<div><strong>[${authorType}] ${
+          authorName || ""
+        }</strong> <span class="meta">${formatTime(
+          createdAt || Date.now()
+        )}</span></div><div>${escapeHtml(text)}</div>`;
+        msgs.appendChild(div);
         msgs.scrollTop = msgs.scrollHeight;
       }
 
@@ -205,75 +221,146 @@
         );
       }
 
-      $("send").onclick = async () => {
-        if (!activeTicketId) return alert("Select a ticket first");
-        const text = replyInput.value.trim();
+      async function fetchTickets() {
+        const res = await fetch("/api/tickets");
+        return res.ok ? res.json() : [];
+      }
+
+      async function loadThreadHistory(id) {
+        const res = await fetch(`/api/tickets/${id}/chat`);
+        const data = await res.json();
+        if (data?.success) {
+          msgs.innerHTML = "";
+          data.messages.forEach(addMsg);
+        } else {
+          console.error("Thread history failed:", data);
+        }
+      }
+
+      async function openThread(id, title) {
+        activeTicketId = id;
+        selectActiveRow(id);
+        threadTitle.textContent = `Thread — ${title} (${id})`;
+        chatInput.disabled = false;
+        sendBtn.disabled = false;
+
+        socket.emit("join", { ticketId: id }); // join ticket room
+        await loadThreadHistory(id);
+      }
+
+      function pruneSelfBuffer() {
+        const now = Date.now();
+        // keep only the last ~2 seconds of entries
+        for (let i = recentSelfSends.length - 1; i >= 0; i--) {
+          if (now - recentSelfSends[i].at > 2000) recentSelfSends.splice(i, 1);
+        }
+      }
+
+      async function sendStaffMessage() {
+        const text = chatInput.value.trim();
         if (!text) return;
-        replyInput.value = "";
-        await fetch(`/api/tickets/${activeTicketId}/chat`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            authorType: "agent",
-            authorName: "Agent",
-            text,
-          }),
+        if (!activeTicketId) {
+          console.warn("No activeTicketId — open a ticket first.");
+          return;
+        }
+        const authorName = agentNameInput.value.trim() || "Support";
+        chatInput.value = "";
+
+        // Optimistic render
+        addMsg({ authorType: "staff", authorName, text });
+
+        // Track our own send so we can ignore the echoed chat:new
+        recentSelfSends.push({ text, authorName, at: Date.now() });
+        pruneSelfBuffer();
+
+        try {
+          const res = await fetch(`/api/tickets/${activeTicketId}/chat`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ authorType: "staff", authorName, text }),
+          });
+          if (!res.ok) {
+            const body = await res.json().catch(() => ({}));
+            console.error("Staff send failed:", res.status, body);
+            addMsg({
+              authorType: "bot",
+              authorName: "AutoBot",
+              text: `⚠️ Failed to send (${res.status})`,
+            });
+          }
+        } catch (e) {
+          console.error("Staff network error:", e);
+          addMsg({
+            authorType: "bot",
+            authorName: "AutoBot",
+            text: "⚠️ Network error.",
+          });
+        }
+      }
+
+      sendBtn.onclick = sendStaffMessage;
+      chatInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          sendStaffMessage();
+        }
+      });
+
+      (async function init() {
+        paintTickets(await fetchTickets());
+
+        socket = io();
+        socket.on("connect", () => {
+          socket.emit("join", { role: "staff" }); // global staff room
         });
-      };
 
-      $("close").onclick = async () => {
-        if (!activeTicketId) return alert("Select a ticket first");
-        await fetch(`/api/tickets/${activeTicketId}/close`, {
-          method: "PATCH",
+        socket.on("chat:new", (m) => {
+          console.log("[staff chat:new]", m);
+          if (String(m.ticketId) !== String(activeTicketId)) return;
+
+          // If this is our own just-sent message, skip the echo (we already optimistically rendered it)
+          if (m.authorType === "staff") {
+            pruneSelfBuffer();
+            const i = recentSelfSends.findIndex(
+              (s) =>
+                s.authorName === m.authorName &&
+                s.text === m.text &&
+                Math.abs(new Date(m.createdAt).getTime() - s.at) < 2000
+            );
+            if (i !== -1) {
+              // matched our own recent send — ignore this echo
+              recentSelfSends.splice(i, 1);
+              return;
+            }
+          }
+
+          addMsg(m);
         });
-        loadTickets();
-      };
 
-      // live updates
-      socket.on("chat:new", (m) => {
-        if (String(m.ticketId) === String(activeTicketId)) addMsg(m);
-        const t = tickets.find((x) => String(x._id) === String(m.ticketId));
-        if (t) {
-          t.messageCount = (t.messageCount || 0) + 1;
-          t.lastMessageSnippet = m.text.slice(0, 120);
-          t.lastMessageAt = new Date().toISOString();
-          renderTickets();
-        }
-      });
+        socket.on("ticket:meta", ({ id, messageCount, lastMessageSnippet }) => {
+          const r =
+            ticketList.querySelector(`.row[data-ticket-id="${id}"]`) ||
+            Array.from(ticketList.querySelectorAll(".row")).find(
+              (el) => el.dataset.ticketId === String(id)
+            );
+          if (!r) {
+            fetchTickets().then(paintTickets);
+            return;
+          }
+          const countEl = r.querySelector(".count");
+          if (countEl) countEl.textContent = String(messageCount || 0);
+          const mutes = r.querySelectorAll(".muted");
+          if (mutes[1])
+            mutes[1].textContent = (lastMessageSnippet || "").slice(0, 100);
+        });
 
-      socket.on("ticket:meta", (p) => {
-        const t = tickets.find((x) => String(x._id) === String(p.id));
-        if (t) {
-          if (typeof p.messageCount === "number")
-            t.messageCount = p.messageCount;
-          if (p.lastMessageSnippet) t.lastMessageSnippet = p.lastMessageSnippet;
-          if (p.lastMessageAt) t.lastMessageAt = p.lastMessageAt;
-          renderTickets();
-        }
-      });
-
-      socket.on("ticket:created", (t) => {
-        tickets.unshift(t);
-        renderTickets();
-      });
-      socket.on("ticket:updated", (p) => {
-        const t = tickets.find((x) => String(x._id) === String(p.id));
-        if (t) {
-          t.status = p.status;
-          renderTickets();
-        }
-      });
-      socket.on("ticket:closed", (t) => {
-        const i = tickets.findIndex((x) => String(x._id) === String(t._id));
-        if (i >= 0) {
-          tickets[i] = t;
-          renderTickets();
-        }
-        if (String(t._id) === String(activeTicketId))
-          statusPill.textContent = "Status: fixed";
-      });
-
-      loadTickets();
+        socket.on("ticket:created", async () =>
+          paintTickets(await fetchTickets())
+        );
+        socket.on("ticket:closed", async () =>
+          paintTickets(await fetchTickets())
+        );
+      })();
     </script>
   </body>
 </html>

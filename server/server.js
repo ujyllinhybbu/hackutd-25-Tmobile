@@ -31,7 +31,7 @@ async function computeStats() {
     { $group: { _id: "$severity", count: { $sum: 1 } } },
   ]);
   const severityCounts = { minor: 0, major: 0, critical: 0 };
-  for (const row of bySeverity) severityCounts[row._id] = row.count;
+  for (const row of bySeverity) severityCounts[row._id] = row.count || 0;
 
   // Avg resolution time (fixed)
   const recentClosed = await Ticket.find({ status: "fixed" })
@@ -125,9 +125,45 @@ app.post("/api/tickets", async (req, res) => {
       messageCount: 0,
     });
 
+    // ✨ Persist a bot welcome message so it shows for both user & staff
+    const welcomeText =
+      "🤖 Chatbot will triage your issue and a specialist will join shortly.";
+    const botMsg = await ChatMessage.create({
+      ticketId: ticket._id,
+      authorType: "bot",
+      authorName: "AutoBot",
+      text: welcomeText,
+    });
+
+    // Update denorm fields for dashboards
+    ticket.lastMessageAt = botMsg.createdAt;
+    ticket.lastMessageSnippet = welcomeText.slice(0, 120);
+    ticket.messageCount = (ticket.messageCount || 0) + 1;
+    await ticket.save();
+
+    // Broadcast bot message (user might not have joined yet; they'll get it via history)
+    const payload = {
+      _id: botMsg._id,
+      ticketId: String(botMsg.ticketId),
+      authorType: botMsg.authorType,
+      authorName: botMsg.authorName,
+      text: botMsg.text,
+      createdAt: botMsg.createdAt,
+      updatedAt: botMsg.updatedAt,
+    };
+    io.to(`ticket:${ticket._id}`).emit("chat:new", payload);
+    io.to("support").emit("chat:new", payload);
+
+    // Global meta + stats
     happiness = Math.max(0, happiness - 5);
     io.emit("happiness:update", { happiness });
     io.emit("ticket:created", ticket);
+    io.emit("ticket:meta", {
+      id: String(ticket._id),
+      messageCount: ticket.messageCount,
+      lastMessageSnippet: ticket.lastMessageSnippet,
+      lastMessageAt: ticket.lastMessageAt,
+    });
     await computeAndEmitStats();
 
     res.json({ success: true, ticket });
@@ -161,14 +197,14 @@ app.post("/api/tickets/:id/chat", async (req, res) => {
       return res.status(400).json({ success: false, message: "Text required" });
 
     const message = await ChatMessage.create({
-      ticketId: id,
+      ticketId: new mongoose.Types.ObjectId(id), // explicit cast
       authorType,
       authorName,
       text,
     });
 
     // Update denorm fields for dashboards
-    ticket.lastMessageAt = new Date();
+    ticket.lastMessageAt = message.createdAt;
     ticket.lastMessageSnippet = text.slice(0, 120);
     ticket.messageCount = (ticket.messageCount || 0) + 1;
     await ticket.save();
@@ -383,11 +419,18 @@ io.on("connection", async (socket) => {
 });
 
 // --- Start server ---
+// Connect DB first to avoid race conditions, then listen
 const PORT = process.env.PORT || 4000;
-server.listen(PORT, async () => {
+try {
   await connectDB();
-  console.log(`🚀 Running on PORT ${PORT}`);
-  setInterval(async () => {
-    await computeAndEmitStats();
-  }, 5000);
-});
+  console.log("✅ Mongo connected");
+  server.listen(PORT, () => {
+    console.log(`🚀 Running on PORT ${PORT}`);
+    setInterval(async () => {
+      await computeAndEmitStats();
+    }, 5000);
+  });
+} catch (err) {
+  console.error("❌ Failed to start:", err);
+  process.exit(1);
+}

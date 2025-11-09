@@ -1,3 +1,4 @@
+// models/ChatMessage.js
 import mongoose from "mongoose";
 
 const ChatMessageSchema = new mongoose.Schema(
@@ -10,13 +11,14 @@ const ChatMessageSchema = new mongoose.Schema(
     },
     authorType: {
       type: String,
-      enum: ["user", "agent", "bot"],
+      enum: ["user", "staff", "bot"],
       required: true,
     },
-    authorName: { type: String },
-    text: { type: String, required: true },
+    authorName: { type: String, default: "" },
+    text: { type: String, required: true, trim: true },
   },
   { timestamps: true }
 );
 
-export default mongoose.model("ChatMessage", ChatMessageSchema);
+export default mongoose.models.ChatMessage ||
+  mongoose.model("ChatMessage", ChatMessageSchema);

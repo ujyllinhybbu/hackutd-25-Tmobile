@@ -91,7 +91,8 @@
       .bot {
         color: #a78bfa;
       }
-      .agent {
+      .agent,
+      .staff {
         color: #4ade80;
       }
       .user {
@@ -200,6 +201,37 @@
       let ticketId = null;
       let requesterName = null;
 
+      // --- dedupe our own user sends
+      const recentSelfSends = []; // { text, authorName, at }
+      const pruneSelfBuffer = () => {
+        const now = Date.now();
+        for (let i = recentSelfSends.length - 1; i >= 0; i--) {
+          if (now - recentSelfSends[i].at > 2000) recentSelfSends.splice(i, 1);
+        }
+      };
+
+      // --- room join reliability
+      let joinRetryTimer = null;
+      let joinedRoom = null; // e.g., "ticket:<id>"
+
+      function startJoinRetry() {
+        stopJoinRetry();
+        joinOnce(); // immediate try
+        joinRetryTimer = setInterval(joinOnce, 2000); // retry until confirmed
+      }
+      function stopJoinRetry() {
+        if (joinRetryTimer) {
+          clearInterval(joinRetryTimer);
+          joinRetryTimer = null;
+        }
+      }
+      function joinOnce() {
+        if (!socket || !ticketId) return;
+        const room = `ticket:${ticketId}`;
+        console.log("joining", room);
+        socket.emit("join", { role: "user", ticketId });
+      }
+
       function addMsg({ authorType, authorName, text, createdAt }) {
         const div = document.createElement("div");
         const roleClass = authorType || "user";
@@ -215,6 +247,7 @@
         msgs.appendChild(div);
         msgs.scrollTop = msgs.scrollHeight;
       }
+
       function escapeHtml(s) {
         return (s || "").replace(
           /[&<>"']/g,
@@ -229,6 +262,122 @@
         );
       }
 
+      async function loadHistory(tid) {
+        try {
+          const res = await fetch(`/api/tickets/${tid}/chat`);
+          const data = await res.json();
+          if (data?.success) {
+            msgs.innerHTML = "";
+            data.messages.forEach(addMsg);
+            msgs.scrollTop = msgs.scrollHeight;
+          } else {
+            console.error("History load failed:", data);
+          }
+        } catch (e) {
+          console.error("Failed to load history", e);
+        }
+      }
+
+      function setTicketId(id) {
+        ticketId = String(id);
+        localStorage.setItem("ticketId", ticketId);
+        const u = new URL(location.href);
+        u.searchParams.set("id", ticketId);
+        history.replaceState({}, "", u);
+        ticketPill.textContent = `Ticket: ${ticketId}`;
+        ticketPill.style.display = "inline-block";
+      }
+
+      function enableUI() {
+        chatInput.disabled = false;
+        sendBtn.disabled = false;
+      }
+
+      function wireSocket() {
+        if (socket) return;
+        socket = io();
+
+        socket.on("connect", () => {
+          console.log("socket connected", socket.id);
+          enableUI();
+          if (ticketId) {
+            startJoinRetry();
+            loadHistory(ticketId); // show immediately while joining
+          }
+        });
+
+        // Re-try join on reconnects too
+        socket.io.on("reconnect", () => {
+          console.log("socket reconnected");
+          joinedRoom = null;
+          if (ticketId) {
+            startJoinRetry();
+            loadHistory(ticketId);
+          }
+        });
+
+        socket.on("joined", (d) => {
+          console.log("✅ joined:", d.room);
+          joinedRoom = d.room;
+          // stop retrying once the right room is confirmed
+          if (joinedRoom === `ticket:${ticketId}`) stopJoinRetry();
+        });
+
+        socket.on("connect_error", (err) =>
+          console.error("socket connect_error:", err)
+        );
+        socket.on("error", (err) => console.error("socket error:", err));
+
+        // Live chat stream (staff + user echoes)
+        socket.on("chat:new", (m) => {
+          if (String(m.ticketId) !== String(ticketId)) return;
+
+          // Ignore our own user echo (we drew it optimistically)
+          if (m.authorType === "user") {
+            pruneSelfBuffer();
+            const i = recentSelfSends.findIndex(
+              (s) =>
+                s.authorName === m.authorName &&
+                s.text === m.text &&
+                Math.abs(new Date(m.createdAt).getTime() - s.at) < 2000
+            );
+            if (i !== -1) {
+              recentSelfSends.splice(i, 1);
+              return;
+            }
+          }
+
+          addMsg(m);
+        });
+
+        socket.on("ticket:updated", (p) => {
+          if (p?.id && String(p.id) === String(ticketId) && p.status) {
+            statusPill.textContent = `Status: ${p.status}`;
+            statusPill.style.display = "inline-block";
+          }
+        });
+        socket.on("ticket:closed", (t) => {
+          if (t?._id && String(t._id) === String(ticketId)) {
+            statusPill.textContent = "Status: fixed";
+            statusPill.style.display = "inline-block";
+          }
+        });
+      }
+
+      // Restore existing ticket (URL ?id= or localStorage)
+      (function restoreTicket() {
+        const fromQS = new URLSearchParams(location.search).get("id");
+        const fromLS = localStorage.getItem("ticketId");
+        const restored = fromQS || fromLS;
+        if (restored) {
+          setTicketId(restored);
+          wireSocket();
+          enableUI();
+          startJoinRetry(); // keep trying until server confirms
+          loadHistory(restored);
+        }
+      })();
+
       $("start").onclick = async () => {
         requesterName = $("name").value.trim() || "Guest";
         const city = $("city").value.trim() || "Unknown";
@@ -236,81 +385,84 @@
         const description = $("desc").value.trim() || "";
         const severity = $("severity").value;
 
-        const res = await fetch("/api/tickets", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            requesterName,
-            city,
-            title,
-            description,
-            severity,
-          }),
-        });
-        const data = await res.json();
-        if (!data?.success) return alert("Failed to create ticket");
+        try {
+          const res = await fetch("/api/tickets", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              requesterName,
+              city,
+              title,
+              description,
+              severity,
+            }),
+          });
+          const data = await res.json();
+          if (!data?.success) return alert("Failed to create ticket");
 
-        ticketId = data.ticket._id;
-        ticketPill.textContent = `Ticket: ${ticketId}`;
-        ticketPill.style.display = "inline-block";
-        statusPill.textContent = `Status: ${data.ticket.status}`;
-        statusPill.style.display = "inline-block";
+          setTicketId(data.ticket._id);
+          statusPill.textContent = `Status: ${data.ticket.status}`;
+          statusPill.style.display = "inline-block";
 
-        socket = io();
-        socket.on("connect", () =>
-          socket.emit("join", { role: "user", ticketId })
-        );
-
-        socket.on("joined", (d) => {
-          console.log("✅ Joined room:", d.room);
-        });
-
-        socket.on("chat:new", (m) => {
-          // Always compare IDs as strings to avoid ObjectId mismatch
-          if (String(m.ticketId) === String(ticketId)) addMsg(m);
-        });
-
-        socket.on("ticket:updated", (p) => {
-          if (p?.id && String(p.id) === String(ticketId) && p.status) {
-            statusPill.textContent = `Status: ${p.status}`;
-          }
-        });
-        socket.on("ticket:closed", (t) => {
-          if (t?._id && String(t._id) === String(ticketId)) {
-            statusPill.textContent = "Status: fixed";
-          }
-        });
-
-        chatInput.disabled = false;
-        sendBtn.disabled = false;
-        addMsg({
-          authorType: "bot",
-          authorName: "AutoBot",
-          text: "Hi! A specialist will be with you shortly.",
-        });
+          wireSocket();
+          enableUI();
+          startJoinRetry(); // aggressively join right away
+          loadHistory(ticketId);
+        } catch (e) {
+          console.error("Create ticket failed", e);
+          alert("Failed to create ticket.");
+        }
       };
 
       async function sendChat() {
         const text = chatInput.value.trim();
-        if (!text || !ticketId) return;
-        chatInput.value = "";
-        addMsg({ authorType: "user", authorName: requesterName, text }); // optimistic
-
-        const res = await fetch(`/api/tickets/${ticketId}/chat`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            authorType: "user",
-            authorName: requesterName,
-            text,
-          }),
-        });
-        if (!res.ok)
+        if (!text) return;
+        if (!ticketId) {
           addMsg({
             authorType: "bot",
             authorName: "AutoBot",
-            text: "⚠️ Failed to send. Please retry.",
+            text: "No ticket active. Click Start Chat again.",
           });
+          return;
+        }
+
+        const authorName = requesterName || "You";
+        chatInput.value = "";
+
+        // Optimistic render
+        addMsg({ authorType: "user", authorName, text });
+
+        // Track our own send so we can ignore the echoed chat:new
+        recentSelfSends.push({ text, authorName, at: Date.now() });
+        pruneSelfBuffer();
+
+        try {
+          const res = await fetch(`/api/tickets/${ticketId}/chat`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              authorType: "user",
+              authorName: requesterName || "Guest",
+              text,
+            }),
+          });
+          if (!res.ok) {
+            const body = await res.json().catch(() => ({}));
+            addMsg({
+              authorType: "bot",
+              authorName: "AutoBot",
+              text: `⚠️ Failed to send (${res.status}): ${
+                body?.message || body?.error || "unknown error"
+              }`,
+            });
+          }
+        } catch (e) {
+          addMsg({
+            authorType: "bot",
+            authorName: "AutoBot",
+            text: "⚠️ Network error while sending. Check console.",
+          });
+        }
       }
 
       sendBtn.onclick = sendChat;
